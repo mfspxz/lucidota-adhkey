@@ -1,0 +1,6 @@
+[package]
+name = "adhkey-core"
+version = "0.1.0"
+edition = "2021"
+description = "AdhKey core: identity/key-lifecycle protocol types and state machine. No crypto here."
+license = "MIT OR Apache-2.0"

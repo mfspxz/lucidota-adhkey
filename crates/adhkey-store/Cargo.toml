@@ -1,0 +1,9 @@
+[package]
+name = "adhkey-store"
+version = "0.1.0"
+edition = "2021"
+description = "AdhKey store: the KeyStore trait. Adapters, not allegiance."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+adhkey-core = { path = "../adhkey-core" }

@@ -1,0 +1,107 @@
+1. **KILL-TARGET 9 — CLAIMED → ESTABLISHED LAUNDERING**  
+   **BROKEN**  
+   **Attacker:** Adversary controls heuristic engine `HEURISTIC_X` (registered as a witness source in policy `P_FINANCIAL`).  
+   **Controls:** Heuristic engine issuance, policy witness-type allowlist.  
+   **Steps:**  
+   1. Adversary runs `HEURISTIC_X` on victim `V` and attacker `A` → produces `CLAIMED` edge `E_claimed(A,V)` with score 0.99, `evidence: [heuristic_run_42]`.  
+   2. Policy `P_FINANCIAL` specifies: "witness types: [HEURISTIC_RUN, EMAIL_OTP]".  
+   3. Establishment evaluator consumes `evidence` field of `E_claimed` statement directly as witness set `W`.  
+   4. `heuristic_run_42` is a `StatementRef`; evaluator treats it as a valid witness statement from authorized issuer `HEURISTIC_X`.  
+   5. `E_established(A,V)` minted under `P_FINANCIAL`.  
+   **What system does wrong:** Conflates *heuristic provenance* (the run reference) with *independent witness evidence*. The `evidence` vector on a `CLAIMED` statement is heuristic-internal metadata, not a `SUPPORTED_BY` edge to independent attestations. No code path distinguishes witness-type taxonomy.
+
+2. **KILL-TARGET 10 — WEIGHT LAUNDERING VIA TRAVERSAL PRIORITY**  
+   **BROKEN**  
+   **Attacker:** Adversary controls graph topology and heuristic scores.  
+   **Controls:** 10,000 attacker nodes `A_i` with fabricated behavioral similarity to victim `V`; one legitimate witness `W_legit` (hardware key).  
+   **Steps:**  
+   1. Adversary generates `CLAIMED` edges `A_i --[0.999]--> V` for all `i`.  
+   2. Legitimate path: `W_legit --[CLAIMED:0.6]--> V` (lower score, real device).  
+   3. Witness collector has 50ms budget, priority-queue by weight.  
+   4. Collector drains budget traversing 10,000 high-weight `A_i` edges; `W_legit` never dequeued.  
+   5. Establishment fails for lack of witnesses → victim locked out; or attacker's forged witness (from compromised `A_i`) gets collected instead.  
+   **What system does wrong:** Treats weight as pure priority without fairness, quota, or witness-type diversity constraints. Weight becomes a covert channel for evidence selection.
+
+3. **KILL-TARGET 11 — INVALIDATION RACE (TOCTOU ON REVOCATION)**  
+   **BROKEN**  
+   **Attacker:** Network adversary delaying revocation propagation; victim holds active lease.  
+   **Controls:** Network partition between revocation log and lease evaluator.  
+   **Steps:**  
+   1. `Key_01` revoked at `T_rev` (statement appended to log).  
+   2. Invalidation traversal begins but requires walking 50,000 dependent `E_established` edges (no reverse index).  
+   3. At `T_rev + 200ms`, lease evaluator in partitioned zone checks `E_authorized(A,B)` → sees valid lease (invalidation not arrived).  
+   4. Evaluator issues capability token.  
+   5. Invalidation completes at `T_rev + 2.3s`; lease retroactively invalid but token already exercised.  
+   **What system does wrong:** Claims "same clock cycle" termination with no synchrony bound, no reverse index for O(1) dependent lookup, and no lease re-check at exercise time. The O(1) claim is false; actual cost is O(dependents) with unbounded latency.
+
+4. **KILL-TARGET 12 — GHOST CLUMPING + ONE WEAK WITNESS**  
+   **BROKEN**  
+   **Attacker:** Adversary with SIM-swap capability + behavioral spoofing farm.  
+   **Controls:** IP/UA/geo/canvas signals for victim `V`; victim's phone number for SMS OTP.  
+   **Steps:**  
+   1. Ghost clumping: 500 spoofed nodes generate `CLAIMED` edges to `V` with scores >0.95 (behavioral vectors).  
+   2. Policy `P_HIGH` requires: "1 heuristic candidate + 1 witness from {PASSKEY, SMS_OTP}".  
+   3. Adversary SIM-swaps `V`, receives SMS OTP, submits as witness `W_sms`.  
+   4. Establishment evaluator sees: dense `CLAIMED` cluster (candidate) + valid `W_sms` (witness) → promotes to `E_established`.  
+   5. `E_authorized` lease issued for financial disbursement.  
+   **What system does wrong:** Policy witness allowlist includes SMS_OTP (known phishable/swappable). The protocol does not define witness-type assurance levels or binding requirements for high-assurance policies. "Which witness types may a HIGH-assurance policy accept?" is unanswered — deployer-dependent, hence broken.
+
+5. **KILL-TARGET 13 — EQL TIER CONFUSION**  
+   **BROKEN**  
+   **Attacker:** Malicious query parameter injection via compromised frontend.  
+   **Controls:** Query string sent to EQL planner.  
+   **Steps:**  
+   1. Legitimate query: `MATCH ... WHERE e.tier = $tier` with `$tier = 'ESTABLISHED'`.  
+   2. Attacker injects: `$tier = 'ESTABLISHED' OR e.tier = 'CLAIMED'` (planner uses string interpolation, not typed enum).  
+   3. Planner executes union; returns `CLAIMED` edges mixed with `ESTABLISHED`.  
+   4. Application iterates results, uses `payout_account` from first row → attacker-controlled `CLAIMED` node.  
+   **What system does wrong:** Tier is a string parameter in the query planner, not a type-enforced capability. No signed query binding, no planner-enforced tier monotonicity. Trust boundary is the planner — which is unverified code.
+
+6. **KILL-TARGET 14 — PRIMITIVE COMPOSITION SEAMS**  
+   **BROKEN**  
+   **Attacker:** Caller to `au` (authority evaluator) with fabricated subgraph.  
+   **Controls:** Input to `au.evaluate(subgraph, policy, context)`.  
+   **Steps:**  
+   1. Attacker constructs in-memory `E_established` edges: `A --[ESTABLISHED, policy=P_FIN, witness=W_fake]--> B`.  
+   2. `W_fake` is a synthesized `evd` node with valid-looking signature (self-signed).  
+   3. Attacker calls `au.evaluate(fabricated_subgraph, P_FIN, ctx)`.  
+   4. Evaluator does not re-derive subgraph from `st` (state log); accepts caller-provided edges.  
+   5. `au` issues `E_authorized` lease.  
+   **What system does wrong:** `au` seam lacks invariant "subgraph must be reduced from `st` at `state_version`". Caller-constructed subgraph violates Doctrine #1 (claim derives authority from its own existence). No authentication on subgraph payload; no requirement for evaluator to self-reduce.
+
+---
+
+**NEW:** Direct attacks on the five operational ideas
+
+**N1. O(1) RETRACTION CLAIM IS FALSE**  
+Idea #2 claims "Cascading Invalidation (O(1) Epistemic Retraction)" but admits "invalidation is traversal over dependents, cost is O(dependents)". No reverse index design exists. No eager lease binding to witness status.  
+**Attack:** Adversary creates identity `V` with 1,000,000 `E_established` edges (via automated witness farming). Revokes one root key. Invalidation walks 1M edges → 47 seconds. During walk, all 1M leases remain valid. System cannot meet any SLA. The O(1) claim is marketing; mechanism is O(n) with no bound.
+
+**N2. "SAME CLOCK CYCLE" LEASE TERMINATION IS NOT A DISTRIBUTED PRIMITIVE**  
+Idea #2 uses "same clock cycle" as if logical time = wall time.  
+**Attack:** Two data centers, 80ms RTT. Revocation commits in DC1 at `T`. Lease evaluator in DC2 checks at `T+10ms` (local clock) → sees valid lease. Revocation arrives at `T+80ms`. Window = 80ms minimum, unbounded under partition. No lease re-validation at *use* time (only at *check* time). The synchrony bound is unspecified because it cannot be specified without consensus — which the design avoids.
+
+**N3. EPISTEMIC FIREWALL FAILS UNDER ADVERSARIAL SCHEDULING**  
+Idea #1 weight priority + Idea #3 ghost clumping assume fair witness collection.  
+**Attack:** Adversary *is* the witness collector (runs the heuristic engine + collector pipeline). Scheduler prioritizes attacker-controlled witness paths, drops legitimate witness statements (backpressure, timeout, OOM). Firewall holds algebraically but fails operationally: the *set of witnesses evaluated* is attacker-chosen. No fairness invariant, no collector audit trail, no diversity enforcement in collection phase.
+
+**N4. EQL AS TRUST BOUNDARY IS UNVERIFIED AND INJECTABLE**  
+Idea #4 makes the query planner a security kernel.  
+**Attack surfaces:**  
+- Tier parameter injection (stringly-typed).  
+- View confusion: planner rewrites `ESTABLISHED` to `CLAIMED` via predicate pushdown bug.  
+- Default tier: omitted tier → planner defaults to `CLAIMED` (permissive).  
+- Confused deputy: planner runs with elevated graph read access; attacker crafts query that traverses `ESTABLISHED` edges but projects `CLAIMED` payloads.  
+No formal verification, no capability-based query authorization, no signed query plan.
+
+**N5. 15-PRIMITIVE SEAMS LACK INVARIANTS — ESPECIALLY `au`/`re` AND `evd`/`po`**  
+Idea #5 lists primitives but not seam contracts.  
+**Critical seams:**  
+- `au` ← `re`: Evaluator consumes relationship edges. **Invariant missing:** "Every `E_established` edge in input must be verifiably reduced from `st` at `state_version V`."  
+- `evd` → `po`: Witness satisfies policy. **Invariant missing:** "Witness type must be in policy's allowed set *and* witness issuer must be in policy's trust domain *and* witness must bind to the specific `E_claimed` candidate."  
+- `st` → `au`: State version at evaluation. **Invariant missing:** "Evaluation must use `st` snapshot at `policy_version`; no stale reads."  
+None of these are encoded in the primitive interfaces. The mapping table is decorative.
+
+---
+
+**VERDICT:** The TIG operational layer has no survivable invariants — every kill-target breaks, the five structural ideas collapse under adversarial scheduling, and the primitive seams are undefended; this design cannot be implemented safely until the Statement model converges *and* each operational claim gets a mechanism with a proven bound.

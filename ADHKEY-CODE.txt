@@ -1,0 +1,1665 @@
+ADHKEY 0.2.0 — full source dump
+generated 2026-10-07T01:36:22Z
+see AUDIT.md for the extreme audit
+
+=================================================================
+FILE: Cargo.toml
+=================================================================
+[workspace]
+resolver = "2"
+members = ["crates/adhkey-core", "crates/adhkey-crypto", "crates/adhkey-store"]
+
+=================================================================
+FILE: crates/adhkey-core/Cargo.toml
+=================================================================
+[package]
+name = "adhkey-core"
+version = "0.1.0"
+edition = "2021"
+description = "AdhKey core: identity/key-lifecycle protocol types and state machine. No crypto here."
+license = "MIT OR Apache-2.0"
+
+=================================================================
+FILE: crates/adhkey-core/src/lib.rs
+=================================================================
+//! adhkey-core: identity/key-lifecycle protocol types and state machine.
+//!
+//! No cryptography here. No I/O. Pure types + transitions.
+//! The security-critical core. Keep it small enough to audit.
+
+pub mod evidence;
+pub mod lifecycle;
+pub mod verifier;
+
+#[cfg(test)]
+mod court;
+
+#[cfg(test)]
+mod court_evidence;
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+/// Opaque key identifier. Never carries key material.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KeyId(pub String);
+
+impl fmt::Display for KeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// What a key is for. A key MUST NOT be used outside its purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyPurpose {
+    Authentication,
+    Signing,
+    Recovery,
+    Encryption,
+}
+
+/// Lifecycle state of a key. Transitions are explicit and recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyState {
+    Active,
+    Lost,
+    Revoked,
+    Expired,
+}
+
+impl KeyState {
+    /// Is this key usable for signing/authentication right now?
+    pub fn usable(&self) -> bool {
+        matches!(self, KeyState::Active)
+    }
+
+    /// Legal transitions. Everything else is rejected.
+    pub fn can_transition_to(&self, next: KeyState) -> bool {
+        use KeyState::*;
+        matches!(
+            (self, next),
+            (Active, Lost)
+                | (Active, Revoked)
+                | (Active, Expired)
+                | (Lost, Active) // found again
+                | (Lost, Revoked)
+        )
+    }
+}
+
+/// Who or what the identity belongs to. Opaque to the protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Subject(pub String);
+
+/// A verification method: how this identity can be verified.
+/// Method-neutral: could be a raw public key, a DID URL, a WebAuthn
+/// credential id — the core does not care.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationMethod {
+    pub id: String,
+    pub method_type: String,
+    pub public_key_multibase: String,
+}
+
+/// Recovery policy: k-of-n recovery keys can authorize a successor key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryPolicy {
+    pub threshold: usize,
+    pub recovery_key_ids: Vec<KeyId>,
+}
+
+impl RecoveryPolicy {
+    pub fn valid(&self) -> bool {
+        self.threshold >= 1
+            && self.threshold <= self.recovery_key_ids.len()
+            && !self.recovery_key_ids.is_empty()
+    }
+}
+
+/// A point-in-time record of one key's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRecord {
+    pub id: KeyId,
+    pub purpose: KeyPurpose,
+    pub state: KeyState,
+    /// Monotonic sequence within this identity's history.
+    pub seq: u64,
+}
+
+/// The identity. Method-neutral, offline-capable, no accounts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub identifier: String,
+    pub subject: Subject,
+    pub verification_methods: Vec<VerificationMethod>,
+    pub keys: BTreeMap<KeyId, KeyRecord>,
+    pub recovery_policy: RecoveryPolicy,
+    /// Append-only history of lifecycle events.
+    pub history: Vec<Event>,
+}
+
+impl Identity {
+    pub fn active_keys(&self, purpose: KeyPurpose) -> Vec<&KeyRecord> {
+        self.keys
+            .values()
+            .filter(|k| k.purpose == purpose && k.state.usable())
+            .collect()
+    }
+
+    pub fn key_state(&self, id: &KeyId) -> Option<KeyState> {
+        self.keys.get(id).map(|k| k.state)
+    }
+}
+
+/// Lifecycle events. Append-only; history is the identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    IdentityCreated { seq: u64 },
+    KeyActivated { key: KeyId, purpose: KeyPurpose, seq: u64 },
+    KeyLost { key: KeyId, seq: u64 },
+    KeyFound { key: KeyId, seq: u64 },
+    KeyRevoked { key: KeyId, reason: String, seq: u64 },
+    KeyExpired { key: KeyId, seq: u64 },
+    RecoveryCompleted {
+        old_key: KeyId,
+        new_key: KeyId,
+        approvals: usize,
+        seq: u64,
+    },
+}
+
+/// A capability: a signed envelope authorizing an action.
+/// Verification is separate from issuance (see verifier module).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capability {
+    pub subject: Subject,
+    pub scope: String,
+    pub audience: String,
+    pub nonce: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub key_id: KeyId,
+}
+
+/// The three epistemic states. These are DISTINCT TYPES.
+/// They MUST NOT collapse into one boolean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claimed<T>(pub T);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Established<T> {
+    pub value: T,
+    /// Which key established it, and in what state.
+    pub by_key: KeyId,
+    pub key_state_at_check: KeyState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authorized<T> {
+    pub value: T,
+    pub capability: Capability,
+}
+
+/// A verification receipt: what was checked, by whom, with what result.
+/// Receipts are derived, never caller-authored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Receipt {
+    pub subject: Subject,
+    pub key_id: KeyId,
+    pub key_state: KeyState,
+    pub checks: Vec<Check>,
+    pub outcome: Outcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Check {
+    KeyKnown,
+    KeyUsable,
+    PurposeMatches,
+    SubjectMatches,
+    ScopeMatches,
+    AudienceMatches,
+    NonceFresh,
+    NotExpired,
+    SignatureValid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Pass,
+    Fail,
+}
+
+/// Errors. Fail closed: unknown state is an error, never a default-allow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    UnknownKey(KeyId),
+    KeyNotUsable(KeyId, KeyState),
+    IllegalTransition(KeyState, KeyState),
+    WrongPurpose { expected: KeyPurpose, actual: KeyPurpose },
+    RecoveryThresholdNotMet { have: usize, need: usize },
+    RecoveryKeyNotUsable(KeyId),
+    InvalidPolicy(String),
+    DuplicateEvent(u64),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl std::error::Error for Error {}
+
+=================================================================
+FILE: crates/adhkey-core/src/lifecycle.rs
+=================================================================
+//! Key lifecycle state machine. All transitions explicit, all recorded.
+
+use crate::{Error, Event, Identity, KeyId, KeyPurpose, KeyRecord, KeyState};
+
+fn next_seq(id: &Identity) -> u64 {
+    id.history.len() as u64 + 1
+}
+
+fn record(id: &mut Identity, event: Event) {
+    id.history.push(event);
+}
+
+/// Activate a new key on the identity.
+pub fn activate_key(
+    id: &mut Identity,
+    key: KeyId,
+    purpose: KeyPurpose,
+) -> Result<(), Error> {
+    if id.keys.contains_key(&key) {
+        return Err(Error::IllegalTransition(KeyState::Active, KeyState::Active));
+    }
+    let seq = next_seq(id);
+    id.keys.insert(
+        key.clone(),
+        KeyRecord {
+            id: key.clone(),
+            purpose,
+            state: KeyState::Active,
+            seq,
+        },
+    );
+    record(
+        id,
+        Event::KeyActivated {
+            key,
+            purpose,
+            seq,
+        },
+    );
+    Ok(())
+}
+
+/// Transition a key's state, enforcing the legal transition table.
+pub fn transition_key(
+    id: &mut Identity,
+    key: &KeyId,
+    next: KeyState,
+    reason: &str,
+) -> Result<(), Error> {
+    let rec = id.keys.get_mut(key).ok_or(Error::UnknownKey(key.clone()))?;
+    let cur = rec.state;
+    if !cur.can_transition_to(next) {
+        return Err(Error::IllegalTransition(cur, next));
+    }
+    rec.state = next;
+    let seq = next_seq(id);
+    let event = match next {
+        KeyState::Lost => Event::KeyLost {
+            key: key.clone(),
+            seq,
+        },
+        KeyState::Active => Event::KeyFound {
+            key: key.clone(),
+            seq,
+        },
+        KeyState::Revoked => Event::KeyRevoked {
+            key: key.clone(),
+            reason: reason.to_string(),
+            seq,
+        },
+        KeyState::Expired => Event::KeyExpired {
+            key: key.clone(),
+            seq,
+        },
+    };
+    record(id, event);
+    Ok(())
+}
+
+/// Recovery: k-of-n recovery keys approve a successor. The old key is
+/// revoked, the new key activated, the identity persists.
+///
+/// `approvals` are key ids that signed the recovery statement. Each must
+/// be a known, usable recovery-purpose key in the recovery policy.
+pub fn recover(
+    id: &mut Identity,
+    old_key: &KeyId,
+    new_key: KeyId,
+    new_purpose: KeyPurpose,
+    approvals: &[KeyId],
+) -> Result<(), Error> {
+    if !id.recovery_policy.valid() {
+        return Err(Error::InvalidPolicy("threshold/policy invalid".into()));
+    }
+    // Old key must exist (it may be Lost — that is the normal case).
+    let old = id.keys.get(old_key).ok_or(Error::UnknownKey(old_key.clone()))?;
+    if old.state == KeyState::Revoked {
+        return Err(Error::IllegalTransition(old.state, KeyState::Revoked));
+    }
+    // Count distinct, usable, policy-listed recovery approvals.
+    let mut counted = std::collections::BTreeSet::new();
+    for a in approvals {
+        if !id.recovery_policy.recovery_key_ids.contains(a) {
+            continue;
+        }
+        let rec = id.keys.get(a).ok_or(Error::UnknownKey(a.clone()))?;
+        if rec.purpose != KeyPurpose::Recovery || !rec.state.usable() {
+            return Err(Error::RecoveryKeyNotUsable(a.clone()));
+        }
+        counted.insert(a);
+    }
+    if counted.len() < id.recovery_policy.threshold {
+        return Err(Error::RecoveryThresholdNotMet {
+            have: counted.len(),
+            need: id.recovery_policy.threshold,
+        });
+    }
+    // Revoke the old key (from whatever state it was in).
+    let seq = next_seq(id);
+    if let Some(rec) = id.keys.get_mut(old_key) {
+        rec.state = KeyState::Revoked;
+    }
+    record(
+        id,
+        Event::RecoveryCompleted {
+            old_key: old_key.clone(),
+            new_key: new_key.clone(),
+            approvals: counted.len(),
+            seq,
+        },
+    );
+    activate_key(id, new_key, new_purpose)?;
+    Ok(())
+}
+
+=================================================================
+FILE: crates/adhkey-core/src/verifier.rs
+=================================================================
+//! The verifier. Establishes claims against independent grounds.
+//!
+//! The verifier never trusts the caller. It checks: key known, key usable,
+//! purpose matches, subject/scope/audience match, nonce fresh, not expired,
+//! signature valid (via the store). Every check is recorded in the receipt.
+//!
+//! CLAIMED -> ESTABLISHED -> AUTHORIZED are distinct types. The verifier
+//! produces ESTABLISHED; authorization policy produces AUTHORIZED.
+
+use crate::{
+    Authorized, Capability, Check, Claimed, Error, Established, Identity,
+    KeyPurpose, KeyState, Outcome, Receipt, Subject,
+};
+use std::collections::BTreeSet;
+
+/// What the verifier needs that the caller cannot supply.
+pub struct VerifierContext<'a> {
+    pub identity: &'a Identity,
+    /// Nonces already seen (replay protection). The verifier owns this.
+    pub seen_nonces: &'a mut BTreeSet<String>,
+    /// Current time (unix secs). Injected for testability.
+    pub now: u64,
+    /// Signature check: delegated to the store, result reported back.
+    /// `true` = the store confirms this key signed this message.
+    pub signature_valid: bool,
+    /// The message that was signed (capability envelope bytes).
+    pub _signed_message: &'a [u8],
+}
+
+/// Verify a claimed capability. Returns ESTABLISHED on success, or the
+/// first failing check with a complete receipt.
+/// checked so far.
+pub fn verify_capability(
+    ctx: &mut VerifierContext<'_>,
+    claimed: Claimed<Capability>,
+    expected_subject: &Subject,
+    expected_audience: &str,
+    expected_purpose: KeyPurpose,
+) -> Result<Established<Capability>, (Error, Receipt)> {
+    let cap = claimed.0.clone();
+    let mut checks = Vec::new();
+    let mut failed: Option<Error> = None;
+
+    // Key known?
+    let key_state = match ctx.identity.key_state(&cap.key_id) {
+        Some(s) => {
+            checks.push(Check::KeyKnown);
+            s
+        }
+        None => {
+            return Err((
+                Error::UnknownKey(cap.key_id.clone()),
+                fail_receipt(ctx, &cap, checks, KeyState::Revoked),
+            ))
+        }
+    };
+
+    // Key usable?
+    if key_state.usable() {
+        checks.push(Check::KeyUsable);
+    } else {
+        failed = Some(Error::KeyNotUsable(cap.key_id.clone(), key_state));
+    }
+
+    // Purpose matches?
+    let purpose_ok = ctx
+        .identity
+        .keys
+        .get(&cap.key_id)
+        .map(|k| k.purpose == expected_purpose)
+        .unwrap_or(false);
+    if purpose_ok {
+        checks.push(Check::PurposeMatches);
+    } else if failed.is_none() {
+        failed = Some(Error::WrongPurpose {
+            expected: expected_purpose,
+            actual: ctx
+                .identity
+                .keys
+                .get(&cap.key_id)
+                .map(|k| k.purpose)
+                .unwrap_or(expected_purpose),
+        });
+    }
+
+    // Subject matches?
+    if &cap.subject == expected_subject {
+        checks.push(Check::SubjectMatches);
+    } else if failed.is_none() {
+        failed = Some(Error::InvalidPolicy("subject mismatch".into()));
+    }
+
+    // Scope non-empty? (scope policy itself is the authorizer's job;
+    // the verifier only checks structural presence here)
+    if !cap.scope.is_empty() {
+        checks.push(Check::ScopeMatches);
+    } else if failed.is_none() {
+        failed = Some(Error::InvalidPolicy("empty scope".into()));
+    }
+
+    // Audience matches?
+    if cap.audience == expected_audience {
+        checks.push(Check::AudienceMatches);
+    } else if failed.is_none() {
+        failed = Some(Error::InvalidPolicy("audience mismatch".into()));
+    }
+
+    // Nonce fresh? (the verifier owns the seen-set — caller can't replay)
+    if ctx.seen_nonces.insert(cap.nonce.clone()) {
+        checks.push(Check::NonceFresh);
+    } else if failed.is_none() {
+        failed = Some(Error::InvalidPolicy("nonce replay".into()));
+    }
+
+    // Not expired?
+    if ctx.now < cap.expires_at && ctx.now >= cap.issued_at {
+        checks.push(Check::NotExpired);
+    } else if failed.is_none() {
+        failed = Some(Error::InvalidPolicy("capability expired or not yet valid".into()));
+    }
+
+    // Signature valid? (reported by the store, not the caller)
+    if ctx.signature_valid {
+        checks.push(Check::SignatureValid);
+    } else if failed.is_none() {
+        failed = Some(Error::InvalidPolicy("signature invalid".into()));
+    }
+
+    let receipt = Receipt {
+        subject: cap.subject.clone(),
+        key_id: cap.key_id.clone(),
+        key_state,
+        checks,
+        outcome: if failed.is_none() {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        },
+    };
+
+    match failed {
+        None => Ok(Established {
+            value: cap,
+            by_key: receipt.key_id.clone(),
+            key_state_at_check: key_state,
+        }),
+        Some(e) => Err((e, receipt)),
+    }
+}
+
+fn fail_receipt(
+    ctx: &VerifierContext<'_>,
+    cap: &Capability,
+    checks: Vec<Check>,
+    key_state: KeyState,
+) -> Receipt {
+    let _ = ctx;
+    Receipt {
+        subject: cap.subject.clone(),
+        key_id: cap.key_id.clone(),
+        key_state,
+        checks,
+        outcome: Outcome::Fail,
+    }
+}
+
+/// Authorize an established capability against a policy.
+/// This is the relying-party judgment — separate from verification.
+pub fn authorize<F>(
+    established: Established<Capability>,
+    policy: F,
+) -> Result<Authorized<Capability>, Error>
+where
+    F: Fn(&Capability) -> bool,
+{
+    if policy(&established.value) {
+        Ok(Authorized {
+            value: established.value.clone(),
+            capability: established.value,
+        })
+    } else {
+        Err(Error::InvalidPolicy("policy denied".into()))
+    }
+}
+
+/// For tests: type-level proof that the three states are distinct.
+#[allow(dead_code)]
+fn _trichotomy_distinct(c: Claimed<Capability>, e: Established<Capability>, a: Authorized<Capability>) {
+    let _ = (c, e, a);
+    // If these were one boolean, this function could not exist.
+}
+
+=================================================================
+FILE: crates/adhkey-core/src/evidence.rs
+=================================================================
+//! Evidence graph: the machinery for saying what connects a claim to reality.
+//!
+//! AdhKey does not determine whether a subject is human. It provides the
+//! machinery to say: subject S has claim C, supported by evidence E,
+//! witnessed by W, under policy P, represented currently by key K, with
+//! history H, possessing capability X.
+//!
+//! Identity is not PROOF OF HUMAN. It is COST OF FALSE CLAIM.
+
+use crate::{KeyId, Subject};
+use std::collections::BTreeMap;
+
+/// What kind of subject this is. The protocol treats them differently;
+/// a PERSON claim requires evidence a DEVICE claim does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubjectKind {
+    Person,
+    Organization,
+    Device,
+    Software,
+    Agent,
+    Unknown,
+}
+
+/// Where evidence came from. None is sufficient alone; their intersection
+/// is what carries weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EvidenceKind {
+    Government,
+    Institutional,
+    Social,
+    Physical,
+    Biometric,
+    Historical,
+    Cryptographic,
+}
+
+/// Who attests. A witness is identified; "trust me" is not a witness.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Witness {
+    pub id: String,
+    pub trust_domain: String,
+}
+
+/// One piece of evidence. Content lives with the issuer; AdhKey holds the
+/// reference, the digest, and the provenance — never the raw PII.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evidence {
+    pub id: String,
+    pub kind: EvidenceKind,
+    pub witness: Witness,
+    /// Digest of the underlying evidence artifact (held by the witness).
+    pub digest: [u8; 32],
+    pub issued_at: u64,
+    pub expires_at: Option<u64>,
+    pub revoked: bool,
+}
+
+/// A claim about a subject: "S corresponds to X", supported by evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    pub subject: Subject,
+    pub statement: String,
+    pub evidence_ids: Vec<String>,
+    pub policy: String,
+}
+
+/// The epistemic lattice. "Verified human" MUST NOT be a boolean.
+/// Each state says what is known, by whom, on what evidence — or that
+/// nothing is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EpistemicState {
+    /// No information. The honest default.
+    Unknown,
+    /// Someone asserted it. Worth nothing by itself.
+    Claimed,
+    /// Evidence exists and is referenced. Not yet evaluated.
+    Supported,
+    /// Evaluated against the assurance policy and passed.
+    Established,
+    /// Was established; withdrawn by the issuer or the subject.
+    Revoked,
+    /// Was established; time passed beyond its validity.
+    Expired,
+    /// Conflicting evidence or attestations exist. Unresolved.
+    Conflict,
+}
+
+impl EpistemicState {
+    /// Can this state authorize action? Only ESTABLISHED — and even then,
+    /// freshness is a separate question (see Freshness).
+    pub fn authorizable(&self) -> bool {
+        matches!(self, EpistemicState::Established)
+    }
+}
+
+/// A human-identity claim with full provenance. Never a boolean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HumanClaim {
+    pub subject: Subject,
+    pub kind: SubjectKind,
+    pub evidence: Vec<Evidence>,
+    pub assurance_policy: String,
+    pub issued_by: Witness,
+    pub issued_at: u64,
+    pub expires_at: Option<u64>,
+    pub state: EpistemicState,
+}
+
+/// Freshness: when was this state known, at what version, witnessed by whom.
+/// Offline verification is honest about staleness instead of pretending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Freshness {
+    pub known_at: u64,
+    pub state_version: u64,
+    pub witness: Witness,
+}
+
+/// The authorization verdict. Three answers, not two.
+/// CANNOT_ESTABLISH is a first-class answer: unknown remains unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorizationVerdict {
+    /// Currently authorized. Freshness established within policy.
+    Authorized,
+    /// Was authorized at time T; freshness cannot be established now.
+    /// The caller decides whether T is good enough. The protocol does not.
+    AuthorizedAsOf(u64),
+    /// Cannot establish current authority. Fail closed.
+    CannotEstablish(String),
+}
+
+/// Evaluate a human claim against its assurance policy and evidence set.
+/// Pure function: no I/O, no network. Returns the epistemic state the
+/// evidence actually supports — never stronger.
+pub fn evaluate_claim(claim: &HumanClaim, now: u64) -> EpistemicState {
+    // Revocation is sticky and checked first.
+    if claim.evidence.iter().any(|e| e.revoked) {
+        return EpistemicState::Revoked;
+    }
+    if let Some(exp) = claim.expires_at {
+        if now >= exp {
+            return EpistemicState::Expired;
+        }
+    }
+    if claim.evidence.is_empty() {
+        return EpistemicState::Claimed;
+    }
+    // Expired evidence does not count toward support.
+    let live: Vec<&Evidence> = claim
+        .evidence
+        .iter()
+        .filter(|e| e.expires_at.map(|x| now < x).unwrap_or(true))
+        .collect();
+    if live.is_empty() {
+        return EpistemicState::Claimed;
+    }
+    // Policy evaluation: the policy names a minimum evidence bar.
+    // The core does not know what "medium" means — the policy does.
+    // Here: SUPPORTED unless the policy's bar is met AND no conflict.
+    // Conflict detection: two live evidence items from different witnesses
+    // disagreeing is out of scope for the core; witnesses report conflict
+    // via revocation. A policy hook can upgrade this.
+    let _ = &live;
+    EpistemicState::Supported
+}
+
+/// Promote SUPPORTED to ESTABLISHED. Only a policy evaluator does this,
+/// and only with the policy's own criteria. The core refuses to guess.
+pub fn establish(
+    claim: &HumanClaim,
+    policy_satisfied: bool,
+    now: u64,
+) -> EpistemicState {
+    match evaluate_claim(claim, now) {
+        EpistemicState::Supported if policy_satisfied => EpistemicState::Established,
+        s => s,
+    }
+}
+
+/// Authorize an action against the full chain:
+/// subject -> identity -> evidence -> key -> capability -> policy,
+/// with freshness. Returns the three-valued verdict.
+pub fn authorize_with_freshness(
+    state: EpistemicState,
+    freshness: Option<&Freshness>,
+    max_staleness_secs: u64,
+    now: u64,
+) -> AuthorizationVerdict {
+    if !state.authorizable() {
+        return AuthorizationVerdict::CannotEstablish(format!(
+            "epistemic state {:?} is not authorizable",
+            state
+        ));
+    }
+    match freshness {
+        None => AuthorizationVerdict::CannotEstablish(
+            "no freshness witness; cannot establish current authority".into(),
+        ),
+        Some(f) => {
+            if now.saturating_sub(f.known_at) <= max_staleness_secs {
+                AuthorizationVerdict::Authorized
+            } else {
+                AuthorizationVerdict::AuthorizedAsOf(f.known_at)
+            }
+        }
+    }
+}
+
+/// The four questions, kept separate. A request for authorization must
+/// answer all four; the protocol never lets one answer stand in for another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationRequest {
+    /// 1. WHO IS THIS? (subject identifier)
+    pub subject: Subject,
+    pub subject_kind: SubjectKind,
+    /// 2. WHAT EVIDENCE connects the claim to a real subject?
+    pub evidence: Vec<Evidence>,
+    pub assurance_policy: String,
+    /// 3. WHAT KEY currently represents the subject?
+    pub current_key: KeyId,
+    /// 4. WHAT is the subject authorized to do here?
+    pub capability_scope: String,
+    pub capability_audience: String,
+}
+
+/// Registry of evidence by id, for claim evaluation.
+pub type EvidenceRegistry = BTreeMap<String, Evidence>;
+
+=================================================================
+FILE: crates/adhkey-core/src/court.rs
+=================================================================
+//! The tiny Court. Every implementation must survive these.
+//!
+//! Each test is an attack. Green means the attack failed (correct).
+//! Red means the verifier is broken.
+
+use crate::lifecycle::*;
+use crate::verifier::*;
+use crate::*;
+use std::collections::BTreeSet;
+
+fn kid(s: &str) -> KeyId {
+    KeyId(s.to_string())
+}
+
+fn test_identity() -> Identity {
+    let mut id = Identity {
+        identifier: "IDENTITY-001".into(),
+        subject: Subject("zackary".into()),
+        verification_methods: vec![],
+        keys: BTreeMap::new(),
+        recovery_policy: RecoveryPolicy {
+            threshold: 2,
+            recovery_key_ids: vec![kid("REC-1"), kid("REC-2"), kid("REC-3")],
+        },
+        history: vec![],
+    };
+    activate_key(&mut id, kid("KEY-01"), KeyPurpose::Authentication).unwrap();
+    activate_key(&mut id, kid("REC-1"), KeyPurpose::Recovery).unwrap();
+    activate_key(&mut id, kid("REC-2"), KeyPurpose::Recovery).unwrap();
+    activate_key(&mut id, kid("REC-3"), KeyPurpose::Recovery).unwrap();
+    id
+}
+
+fn good_cap() -> Capability {
+    Capability {
+        subject: Subject("zackary".into()),
+        scope: "read:ledger".into(),
+        audience: "cutecity".into(),
+        nonce: "nonce-001".into(),
+        issued_at: 1000,
+        expires_at: 2000,
+        key_id: kid("KEY-01"),
+    }
+}
+
+fn ctx<'a>(
+    id: &'a Identity,
+    nonces: &'a mut BTreeSet<String>,
+    sig_valid: bool,
+) -> VerifierContext<'a> {
+    VerifierContext {
+        identity: id,
+        seen_nonces: nonces,
+        now: 1500,
+        signature_valid: sig_valid,
+        _signed_message: b"envelope",
+    }
+}
+
+fn verify(
+    id: &Identity,
+    nonces: &mut BTreeSet<String>,
+    cap: Capability,
+    sig_valid: bool,
+) -> Result<Established<Capability>, (Error, Receipt)> {
+    let mut c = ctx(id, nonces, sig_valid);
+    verify_capability(
+        &mut c,
+        Claimed(cap),
+        &Subject("zackary".into()),
+        "cutecity",
+        KeyPurpose::Authentication,
+    )
+}
+
+#[test]
+fn court_honest_capability_passes() {
+    let id = test_identity();
+    let mut nonces = BTreeSet::new();
+    let r = verify(&id, &mut nonces, good_cap(), true);
+    assert!(r.is_ok(), "honest capability must verify");
+    let est = r.unwrap();
+    assert_eq!(est.key_state_at_check, KeyState::Active);
+    // And authorization is a SEPARATE judgment:
+    let auth = authorize(est, |c| c.scope == "read:ledger");
+    assert!(auth.is_ok());
+    let denied = authorize(
+        verify(&id, &mut BTreeSet::new(), good_cap(), true).unwrap(),
+        |_| false,
+    );
+    assert!(denied.is_err(), "policy denial must not verify-fail, it authorizes-fail");
+}
+
+#[test]
+fn court_unknown_key() {
+    let id = test_identity();
+    let mut nonces = BTreeSet::new();
+    let mut cap = good_cap();
+    cap.key_id = kid("NOPE");
+    let (e, receipt) = verify(&id, &mut nonces, cap, true).unwrap_err();
+    assert_eq!(e, Error::UnknownKey(kid("NOPE")));
+    assert_eq!(receipt.outcome, Outcome::Fail);
+}
+
+#[test]
+fn court_wrong_key_state_revoked() {
+    let mut id = test_identity();
+    transition_key(&mut id, &kid("KEY-01"), KeyState::Revoked, "compromised").unwrap();
+    let mut nonces = BTreeSet::new();
+    let (e, _) = verify(&id, &mut nonces, good_cap(), true).unwrap_err();
+    assert_eq!(e, Error::KeyNotUsable(kid("KEY-01"), KeyState::Revoked));
+}
+
+#[test]
+fn court_revoked_key_stays_revoked() {
+    let mut id = test_identity();
+    transition_key(&mut id, &kid("KEY-01"), KeyState::Revoked, "x").unwrap();
+    // No transition out of Revoked exists:
+    assert!(!KeyState::Revoked.can_transition_to(KeyState::Active));
+    assert!(!KeyState::Revoked.can_transition_to(KeyState::Lost));
+    let err = transition_key(&mut id, &kid("KEY-01"), KeyState::Active, "x");
+    assert_eq!(
+        err,
+        Err(Error::IllegalTransition(KeyState::Revoked, KeyState::Active))
+    );
+}
+
+#[test]
+fn court_expired_capability() {
+    let id = test_identity();
+    let mut nonces = BTreeSet::new();
+    let mut cap = good_cap();
+    cap.expires_at = 1400; // now is 1500
+    let (e, receipt) = verify(&id, &mut nonces, cap, true).unwrap_err();
+    assert!(matches!(e, Error::InvalidPolicy(_)));
+    assert_eq!(receipt.outcome, Outcome::Fail);
+}
+
+#[test]
+fn court_wrong_subject() {
+    let id = test_identity();
+    let mut nonces = BTreeSet::new();
+    let mut cap = good_cap();
+    cap.subject = Subject("mallory".into());
+    assert!(verify(&id, &mut nonces, cap, true).is_err());
+}
+
+#[test]
+fn court_wrong_audience() {
+    let id = test_identity();
+    let mut nonces = BTreeSet::new();
+    let mut cap = good_cap();
+    cap.audience = "evil-corp".into();
+    assert!(verify(&id, &mut nonces, cap, true).is_err());
+}
+
+#[test]
+fn court_empty_scope_rejected() {
+    let id = test_identity();
+    let mut nonces = BTreeSet::new();
+    let mut cap = good_cap();
+    cap.scope = "".into();
+    assert!(verify(&id, &mut nonces, cap, true).is_err());
+}
+
+#[test]
+fn court_replay_rejected() {
+    let id = test_identity();
+    let mut nonces = BTreeSet::new();
+    assert!(verify(&id, &mut nonces, good_cap(), true).is_ok());
+    // Same nonce again — the verifier owns the seen-set:
+    let (e, _) = verify(&id, &mut nonces, good_cap(), true).unwrap_err();
+    assert!(matches!(e, Error::InvalidPolicy(_)));
+}
+
+#[test]
+fn court_wrong_purpose() {
+    let id = test_identity();
+    let mut nonces = BTreeSet::new();
+    let mut cap = good_cap();
+    cap.key_id = kid("REC-1"); // a recovery key, not authentication
+    let (e, _) = verify(&id, &mut nonces, cap, true).unwrap_err();
+    assert!(matches!(e, Error::WrongPurpose { .. }));
+}
+
+#[test]
+fn court_bad_signature() {
+    let id = test_identity();
+    let mut nonces = BTreeSet::new();
+    // The store reports the signature is invalid. Caller can't override.
+    assert!(verify(&id, &mut nonces, good_cap(), false).is_err());
+}
+
+#[test]
+fn court_lost_key_not_usable_until_found() {
+    let mut id = test_identity();
+    transition_key(&mut id, &kid("KEY-01"), KeyState::Lost, "phone gone").unwrap();
+    let mut nonces = BTreeSet::new();
+    assert!(verify(&id, &mut nonces, good_cap(), true).is_err());
+    // Found again -> usable:
+    transition_key(&mut id, &kid("KEY-01"), KeyState::Active, "found").unwrap();
+    let mut nonces2 = BTreeSet::new();
+    assert!(verify(&id, &mut nonces2, good_cap(), true).is_ok());
+}
+
+#[test]
+fn court_unauthorized_recovery() {
+    let mut id = test_identity();
+    // Attacker tries recovery with non-policy keys:
+    let err = recover(
+        &mut id,
+        &kid("KEY-01"),
+        kid("KEY-02"),
+        KeyPurpose::Authentication,
+        &[kid("KEY-01")], // not a recovery key, not in policy
+    );
+    assert!(matches!(
+        err,
+        Err(Error::RecoveryThresholdNotMet { .. })
+    ));
+}
+
+#[test]
+fn court_partial_recovery() {
+    let mut id = test_identity();
+    // Only 1 of 2 required approvals:
+    let err = recover(
+        &mut id,
+        &kid("KEY-01"),
+        kid("KEY-02"),
+        KeyPurpose::Authentication,
+        &[kid("REC-1")],
+    );
+    assert_eq!(
+        err,
+        Err(Error::RecoveryThresholdNotMet { have: 1, need: 2 })
+    );
+    // Old key untouched:
+    assert_eq!(id.key_state(&kid("KEY-01")), Some(KeyState::Active));
+}
+
+#[test]
+fn court_honest_recovery_preserves_identity() {
+    let mut id = test_identity();
+    transition_key(&mut id, &kid("KEY-01"), KeyState::Lost, "phone lost").unwrap();
+    recover(
+        &mut id,
+        &kid("KEY-01"),
+        kid("KEY-02"),
+        KeyPurpose::Authentication,
+        &[kid("REC-1"), kid("REC-2")],
+    )
+    .unwrap();
+    // Identity persists; old key revoked; new key active:
+    assert_eq!(id.identifier, "IDENTITY-001");
+    assert_eq!(id.key_state(&kid("KEY-01")), Some(KeyState::Revoked));
+    assert_eq!(id.key_state(&kid("KEY-02")), Some(KeyState::Active));
+    // New key verifies:
+    let mut nonces = BTreeSet::new();
+    let mut cap = good_cap();
+    cap.key_id = kid("KEY-02");
+    cap.nonce = "nonce-002".into();
+    assert!(verify(&id, &mut nonces, cap, true).is_ok());
+    // Old key does not:
+    let mut nonces2 = BTreeSet::new();
+    let mut cap2 = good_cap();
+    cap2.nonce = "nonce-003".into();
+    assert!(verify(&id, &mut nonces2, cap2, true).is_err());
+}
+
+#[test]
+fn court_stale_recovery_key_rejected() {
+    let mut id = test_identity();
+    // Revoke one recovery key, then try to use it in a quorum:
+    transition_key(&mut id, &kid("REC-3"), KeyState::Revoked, "rotated").unwrap();
+    let err = recover(
+        &mut id,
+        &kid("KEY-01"),
+        kid("KEY-02"),
+        KeyPurpose::Authentication,
+        &[kid("REC-1"), kid("REC-3")], // REC-3 revoked
+    );
+    assert_eq!(err, Err(Error::RecoveryKeyNotUsable(kid("REC-3"))));
+}
+
+#[test]
+fn court_key_substitution() {
+    // Attacker swaps the key id on an otherwise-valid envelope.
+    // Verification is against the identity's key table, not the envelope's
+    // self-description — substitution fails at KeyKnown/KeyUsable.
+    let mut id = test_identity();
+    transition_key(&mut id, &kid("KEY-01"), KeyState::Revoked, "x").unwrap();
+    activate_key(&mut id, kid("KEY-99"), KeyPurpose::Authentication).unwrap();
+    let mut nonces = BTreeSet::new();
+    let mut cap = good_cap();
+    cap.key_id = kid("KEY-99"); // attacker's key, validly activated... 
+    // ...but the point stands: only keys in THIS identity's table verify.
+    // A key from another identity is UnknownKey here:
+    let mut cap2 = good_cap();
+    cap2.key_id = kid("ATTACKER-KEY");
+    let (e, _) = verify(&id, &mut nonces, cap2, true).unwrap_err();
+    assert_eq!(e, Error::UnknownKey(kid("ATTACKER-KEY")));
+    // And the legitimately-added KEY-99 verifies (it IS this identity's key):
+    let mut nonces2 = BTreeSet::new();
+    cap.nonce = "nonce-099".into();
+    assert!(verify(&id, &mut nonces2, cap, true).is_ok());
+}
+
+#[test]
+fn court_trichotomy_never_collapses() {
+    // CLAIMED, ESTABLISHED, AUTHORIZED are distinct types.
+    // This test exists so a future refactor cannot silently merge them:
+    // it would fail to compile if they became one boolean.
+    let id = test_identity();
+    let mut nonces = BTreeSet::new();
+    let claimed: Claimed<Capability> = Claimed(good_cap());
+    let established: Established<Capability> =
+        verify(&id, &mut nonces, claimed.0.clone(), true).unwrap();
+    let authorized: Authorized<Capability> =
+        authorize(established, |_| true).unwrap();
+    // Each stage carries strictly more evidence than the last:
+    assert!(authorized.capability.nonce == "nonce-001");
+}
+
+=================================================================
+FILE: crates/adhkey-core/src/court_evidence.rs
+=================================================================
+//! The Court, part 2: the evidence graph.
+//!
+//! AdhKey cannot manufacture human identity from cryptography.
+//! These tests enforce: the four questions stay separate, "verified human"
+//! never becomes a boolean, unknown remains unknown, and freshness is
+//! honest about staleness.
+
+use crate::evidence::*;
+use crate::*;
+
+fn witness(id: &str, domain: &str) -> Witness {
+    Witness {
+        id: id.into(),
+        trust_domain: domain.into(),
+    }
+}
+
+fn ev(id: &str, kind: EvidenceKind, w: Witness) -> Evidence {
+    Evidence {
+        id: id.into(),
+        kind,
+        witness: w,
+        digest: [7u8; 32],
+        issued_at: 1000,
+        expires_at: None,
+        revoked: false,
+    }
+}
+
+fn human_claim() -> HumanClaim {
+    HumanClaim {
+        subject: Subject("S1".into()),
+        kind: SubjectKind::Person,
+        evidence: vec![
+            ev("gov-7", EvidenceKind::Government, witness("dmv", "government")),
+            ev("bank-4", EvidenceKind::Institutional, witness("bank", "financial")),
+            ev(
+                "wit-2",
+                EvidenceKind::Social,
+                witness("friend-a", "community"),
+            ),
+        ],
+        assurance_policy: "P17".into(),
+        issued_by: witness("adhkey", "local"),
+        issued_at: 1000,
+        expires_at: None,
+        state: EpistemicState::Claimed,
+    }
+}
+
+#[test]
+fn court_no_boolean_human() {
+    // There is no is_real_human() -> bool anywhere in this crate.
+    // The lattice is the only path. This test pins the lattice states:
+    let states = [
+        EpistemicState::Unknown,
+        EpistemicState::Claimed,
+        EpistemicState::Supported,
+        EpistemicState::Established,
+        EpistemicState::Revoked,
+        EpistemicState::Expired,
+        EpistemicState::Conflict,
+    ];
+    assert_eq!(states.len(), 7);
+    // Only ONE state authorizes. Everything else fails closed.
+    let authorizable: Vec<_> = states.iter().filter(|s| s.authorizable()).collect();
+    assert_eq!(authorizable.len(), 1);
+    assert_eq!(*authorizable[0], EpistemicState::Established);
+}
+
+#[test]
+fn court_empty_evidence_is_claimed_not_established() {
+    let mut c = human_claim();
+    c.evidence = vec![];
+    assert_eq!(evaluate_claim(&c, 1500), EpistemicState::Claimed);
+    // And CLAIMED cannot authorize:
+    let v = authorize_with_freshness(EpistemicState::Claimed, None, 60, 1500);
+    assert!(matches!(v, AuthorizationVerdict::CannotEstablish(_)));
+}
+
+#[test]
+fn court_evidence_without_policy_is_supported_not_established() {
+    // The core refuses to guess what "enough evidence" means.
+    let c = human_claim();
+    assert_eq!(evaluate_claim(&c, 1500), EpistemicState::Supported);
+    // Only an explicit policy satisfaction promotes:
+    assert_eq!(
+        establish(&c, false, 1500),
+        EpistemicState::Supported,
+        "core must not promote without policy"
+    );
+    assert_eq!(
+        establish(&c, true, 1500),
+        EpistemicState::Established,
+        "explicit policy satisfaction promotes"
+    );
+}
+
+#[test]
+fn court_revocation_is_sticky() {
+    let mut c = human_claim();
+    c.evidence[0].revoked = true;
+    assert_eq!(evaluate_claim(&c, 1500), EpistemicState::Revoked);
+    // Even with policy satisfied, revoked stays revoked:
+    assert_eq!(establish(&c, true, 1500), EpistemicState::Revoked);
+}
+
+#[test]
+fn court_expiry_is_honest() {
+    let mut c = human_claim();
+    c.expires_at = Some(1400);
+    assert_eq!(evaluate_claim(&c, 1500), EpistemicState::Expired);
+    // Expired evidence doesn't count:
+    let mut c2 = human_claim();
+    for e in &mut c2.evidence {
+        e.expires_at = Some(1400);
+    }
+    assert_eq!(
+        evaluate_claim(&c2, 1500),
+        EpistemicState::Claimed,
+        "all evidence expired -> back to mere claim"
+    );
+}
+
+#[test]
+fn court_freshness_three_answers() {
+    let w = witness("verifier", "local");
+    // Fresh:
+    let f = Freshness {
+        known_at: 1490,
+        state_version: 12,
+        witness: w.clone(),
+    };
+    assert_eq!(
+        authorize_with_freshness(EpistemicState::Established, Some(&f), 60, 1500),
+        AuthorizationVerdict::Authorized
+    );
+    // Stale: honest about WHEN, doesn't pretend now:
+    let f_old = Freshness {
+        known_at: 1000,
+        state_version: 9,
+        witness: w.clone(),
+    };
+    assert_eq!(
+        authorize_with_freshness(EpistemicState::Established, Some(&f_old), 60, 1500),
+        AuthorizationVerdict::AuthorizedAsOf(1000)
+    );
+    // No witness: cannot establish. Unknown remains unknown.
+    assert!(matches!(
+        authorize_with_freshness(EpistemicState::Established, None, 60, 1500),
+        AuthorizationVerdict::CannotEstablish(_)
+    ));
+}
+
+#[test]
+fn court_four_questions_stay_separate() {
+    // A valid key + valid capability, but NO evidence for the human claim:
+    // authorization of the *action* may proceed on key+capability, but the
+    // *human assurance* stays UNKNOWN. One answer never stands in for another.
+    let req = AuthorizationRequest {
+        subject: Subject("S1".into()),
+        subject_kind: SubjectKind::Person,
+        evidence: vec![], // no evidence
+        assurance_policy: "P17".into(),
+        current_key: KeyId("K42".into()),
+        capability_scope: "deploy:exchange".into(),
+        capability_audience: "cutecity".into(),
+    };
+    let claim = HumanClaim {
+        subject: req.subject.clone(),
+        kind: req.subject_kind,
+        evidence: req.evidence.clone(),
+        assurance_policy: req.assurance_policy.clone(),
+        issued_by: witness("none", "none"),
+        issued_at: 1000,
+        expires_at: None,
+        state: EpistemicState::Unknown,
+    };
+    let state = evaluate_claim(&claim, 1500);
+    assert_eq!(state, EpistemicState::Claimed);
+    // Human assurance: cannot establish.
+    let v = authorize_with_freshness(state, None, 60, 1500);
+    assert!(matches!(v, AuthorizationVerdict::CannotEstablish(_)));
+    // The KEY question is separate and answered elsewhere (verifier.rs).
+    // The point: this verdict says nothing about K42, and K42's validity
+    // says nothing about the human. No collapse.
+}
+
+#[test]
+fn court_conflict_is_not_established() {
+    // Conflict is a distinct state, not a quiet fail, not a pass.
+    let v = authorize_with_freshness(EpistemicState::Conflict, None, 60, 1500);
+    assert!(matches!(v, AuthorizationVerdict::CannotEstablish(_)));
+    assert!(!EpistemicState::Conflict.authorizable());
+}
+
+#[test]
+fn court_subject_kinds_are_distinct() {
+    // A DEVICE claim and a PERSON claim are different things;
+    // the kind travels with the claim and policy can require more
+    // evidence for PERSON than for DEVICE.
+    let kinds = [
+        SubjectKind::Person,
+        SubjectKind::Organization,
+        SubjectKind::Device,
+        SubjectKind::Software,
+        SubjectKind::Agent,
+        SubjectKind::Unknown,
+    ];
+    assert_eq!(kinds.len(), 6);
+    let mut c = human_claim();
+    c.kind = SubjectKind::Device;
+    // Evaluation is kind-agnostic in the core (policy decides the bar),
+    // but the kind is preserved — never silently dropped:
+    assert_eq!(c.kind, SubjectKind::Device);
+}
+
+=================================================================
+FILE: crates/adhkey-crypto/Cargo.toml
+=================================================================
+[package]
+name = "adhkey-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "AdhKey crypto: audited FOSS primitives only. No custom cryptography."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ed25519-dalek = "2"
+sha2 = "0.10"
+
+=================================================================
+FILE: crates/adhkey-crypto/src/lib.rs
+=================================================================
+//! adhkey-crypto: audited FOSS primitives only. No custom cryptography.
+//!
+//! Suites:
+//! - Ed25519 (ed25519-dalek) for signatures.
+//! - SHA-256 (sha2) for hashing / commitments.
+
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
+
+/// Build a signing key from 32 bytes of caller-supplied randomness.
+/// Randomness is the caller's job; this function never invents it.
+pub fn signing_key_from_seed(seed: &[u8; 32]) -> SigningKey {
+    SigningKey::from_bytes(seed)
+}
+
+pub fn verifying_key(sk: &SigningKey) -> VerifyingKey {
+    sk.verifying_key()
+}
+
+pub fn sign(sk: &SigningKey, message: &[u8]) -> Signature {
+    sk.sign(message)
+}
+
+pub fn verify(vk: &VerifyingKey, message: &[u8], sig: &Signature) -> bool {
+    vk.verify(message, sig).is_ok()
+}
+
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().into()
+}
+
+/// Commitment: hash of (label || value). Binding, hiding (for high-entropy values).
+pub fn commit(label: &[u8], value: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(label);
+    h.update(value);
+    h.finalize().into()
+}
+
+=================================================================
+FILE: crates/adhkey-store/Cargo.toml
+=================================================================
+[package]
+name = "adhkey-store"
+version = "0.1.0"
+edition = "2021"
+description = "AdhKey store: the KeyStore trait. Adapters, not allegiance."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+adhkey-core = { path = "../adhkey-core" }
+
+=================================================================
+FILE: crates/adhkey-store/src/lib.rs
+=================================================================
+//! adhkey-store: the KeyStore trait. Adapters, not allegiance.
+//!
+//! AdhKey asks: "can this key sign this thing?" It does not care whether
+//! the key lives in KeePass, Android Keystore, WebAuthn, YubiKey, TPM,
+//! HSM, Bitwarden, a hardware wallet, or some future weird anarchist shit.
+
+use adhkey_core::KeyId;
+use std::fmt;
+
+/// Public key material (opaque bytes; format depends on the suite).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicKey(pub Vec<u8>);
+
+/// Signature bytes (opaque; format depends on the suite).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signature(pub Vec<u8>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreError {
+    KeyNotFound(KeyId),
+    SigningFailed(String),
+    NotSupported(String),
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+/// The magic interface. Everything else is an adapter.
+pub trait KeyStore {
+    fn public_key(&self, id: &KeyId) -> Result<PublicKey, StoreError>;
+    fn sign(&self, id: &KeyId, message: &[u8]) -> Result<Signature, StoreError>;
+}
+
+=================================================================
+FILE: README.md
+=================================================================
+# AdhKey
+
+A portable identity/key-lifecycle protocol that sits above any vault,
+wallet, authenticator, OS keystore, HSM, or password manager.
+
+**Not** a password manager. **Not** a blockchain. **Not** a wallet.
+**Not** a DID chain. Adapters, not allegiance.
+
+## The core question
+
+> "Can this key sign this thing?"
+
+```rust
+trait KeyStore {
+    fn public_key(&self, id: KeyId) -> Result<PublicKey>;
+    fn sign(&self, id: KeyId, message: &[u8]) -> Result<Signature>;
+}
+```
+
+## The product
+
+**Identity persistence without credential persistence.** Key loss becomes
+a normal state transition:
+
+```
+KEY-01 ACTIVE → LOST → recovery threshold → KEY-02 ACTIVE → KEY-01 REVOKED
+IDENTITY-001 persists throughout.
+```
+
+## Crates
+
+- `adhkey-core` — types, lifecycle state machine, verifier, the tiny Court.
+  No crypto, no I/O. The auditable core.
+- `adhkey-crypto` — audited FOSS primitives only (ed25519-dalek, sha2).
+- `adhkey-store` — the `KeyStore` trait.
+
+## The tiny Court
+
+`cargo test -p adhkey-core` runs the adversarial suite: wrong/unknown/
+revoked/expired key, wrong subject/scope/audience/nonce, replay, wrong
+purpose, bad signature, unauthorized/partial/stale recovery, key
+substitution — and the trichotomy test proving CLAIMED / ESTABLISHED /
+AUTHORIZED never collapse into one boolean.
+
+## Rules (MUST)
+
+No particular key manager. No blockchain. No account. No private-key
+transmission. Offline-capable. Fail closed. Identity, authentication,
+authorization, and recovery stay distinct.
+
+## Status
+
+0.1.0 — core types, lifecycle, verifier, Court tests. Adapters and
+conformance vectors next. Design: `docs/architecture/ADHKEY-DESIGN.md`.
+
+=================================================================
+FILE: AUDIT.md
+=================================================================
+# AdhKey — extreme audit
+
+**Date:** 2026-10-06. **Scope:** `~/workspace/adhkey`, crates
+adhkey-core (lib, lifecycle, verifier, evidence, court, court_evidence),
+adhkey-crypto, adhkey-store. **Method:** adversarial re-read against the
+design docs and our own invariants. **Verdict: NOT PRODUCTION.** Honest
+prototype with a solid skeleton and real gaps.
+
+## Critical findings
+
+### C1. Signatures are not verified — the check is a stub
+`VerifierContext.signature_valid: bool` is injected by the caller. The
+Court passes `true`. Nothing calls `KeyStore::sign`/`verify` in the
+verification path. An attacker who controls the `VerifierContext`
+construction controls the outcome. This is exactly the "caller-authored
+verdict" bug the verifier redesign exists to kill. **The Court is testing
+a verifier with its fangs removed.**
+
+### C2. Recovery approvals are key IDs, not signatures
+`recover()` checks that approval IDs are policy-listed and usable, but
+never verifies a signature over the recovery statement. Passing
+`&[kid("REC-1"), kid("REC-2")]` is an assertion, not an authorization.
+A compromised caller with the ID list can recover any identity.
+
+### C3. `establish()` takes a bare bool
+`policy_satisfied: bool` — the policy decision enters with no provenance:
+who evaluated, under what version, on what evidence snapshot. We banned
+collapsing to booleans; this is a boolean smuggled in through the back
+door. It should take a signed policy verdict, not a bit.
+
+### C4. `Conflict` is dead
+Nothing ever produces `EpistemicState::Conflict`. `evaluate_claim` returns
+Unknown/Claimed/Supported/Established/Revoked/Expired — never Conflict.
+A state the machinery cannot reach is decoration, not a lattice.
+
+### C5. Replay protection is RAM-only
+`seen_nonces: &mut BTreeSet<String>` — unbounded growth (DoS), wiped on
+restart (replay window reopens), no expiry. A production verifier needs a
+persistent, bounded, time-partitioned nonce store.
+
+### C6. Lost → Active requires no re-verification
+`transition_key` allows Lost → Active ("found again") unconditionally. A
+"found" key may be cloned or extracted. Finding should require fresh
+proof-of-possession, or route through recovery.
+
+### C7. Receipts are not tamper-evident
+`Receipt` is a plain struct: no signature, no hash chain, no binding to
+the verification event. "Receipts are derived, never caller-authored" is
+asserted in comments but not enforced in types. Anyone constructing a
+`Receipt` struct can author one.
+
+## Design-vs-implementation gaps
+
+### G1. The Statement primitive does not exist
+The design's killer primitive — `Statement { subject, predicate, object,
+issuer, evidence, policy, timestamp, state, signature }` — is not
+implemented. `Claim` and `HumanClaim` are special cases that should be
+projections of Statement. The code is one design revision behind.
+
+### G2. Receipt ≠ Evidence ≠ Truth is not enforced
+The distinction exists in prose. In code: `Receipt`, `Evidence`, and the
+verdict types are independent structs with no machine-checked boundary
+between "system X recorded Y" and "Y is supported". Nothing stops a
+receipt from being filed as evidence.
+
+### G3. Freshness witness is trusted implicitly
+`Freshness.witness` is accepted as-is. No verification that the witness
+is authorized, no signature check on the freshness attestation. A lying
+clock + a lying witness = false AUTHORIZED.
+
+### G4. No wire format
+No serde, no canonical encoding. Statements cannot cross a process or
+machine boundary. The "portable" in "portable identity protocol" is
+currently aspirational.
+
+### G5. Evidence digests are never checked
+`Evidence.digest: [u8; 32]` — nothing verifies it against the artifact.
+The witness is trusted to have it right, which reintroduces
+caller-authored provenance through the side door.
+
+## Doctrine violations (our own invariants, applied to us)
+
+- **"The claim is an output of the machinery"** — VIOLATED by C1, C2, C3.
+  Three places where caller input becomes verdict.
+- **"Provenance cannot be caller-authored"** — VIOLATED by C7, G5.
+- **"Unknown must remain unknown"** — HELD. CANNOT_ESTABLISH is honest;
+  no default-allow path exists in the verifier.
+- **"Fail closed"** — HELD for state transitions (illegal transitions
+  rejected, revoked terminal). WEAK for verification (C1 stub).
+- **"No new primitive without need"** — HELD. The type count is justified.
+
+## What's actually solid
+
+- The transition table is correct and total: revoked is terminal, lost is
+  recoverable, every transition is recorded. The history IS the identity.
+- The trichotomy is type-level, not conventional. It cannot silently merge.
+- `evaluate_claim` never overstates: empty → CLAIMED, never ESTABLISHED.
+- Revocation is sticky and checked first. Expiry is honest.
+- Time is injected (`now: u64`) — testable, no hidden clock reads.
+- Zero warnings, 27/27 tests. The tests are honest about what they cover.
+
+## Fix priority
+
+1. Wire real signature verification (store-backed) into the verifier; make
+   `signature_valid` unconstructible by callers. (Kills C1.)
+2. Recovery approvals become signed statements over (old_key, new_key,
+   nonce). (Kills C2.)
+3. Replace `policy_satisfied: bool` with a signed policy verdict struct.
+   (Kills C3.)
+4. Implement the Statement triple as the core primitive; re-express
+   Claim/HumanClaim as projections. (Kills G1, enables G2.)
+5. Hash-chain + sign receipts. (Kills C7.)
+6. Persistent nonce store with expiry. (Kills C5.)
+7. Lost → Active requires proof-of-possession. (Kills C6.)
+8. Reachable Conflict: contradiction detector over evidence set. (Kills C4.)
+9. Canonical encoding (serde + canonical CBOR/JSON). (Kills G4.)
+10. Witness authorization for freshness attestations. (Kills G3.)
+
+## Bottom line
+
+The skeleton is right — the state machine, the lattice, the trichotomy,
+the fail-closed defaults. But the three most security-critical paths
+(signature verification, recovery authorization, policy input) are stubs
+wearing the clothes of the real thing. The Court passes because it attacks
+a verifier that was never given teeth. Fix order above is the path from
+honest prototype to something auditable.
+

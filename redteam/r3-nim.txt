@@ -1,0 +1,58 @@
+**Kill‑Target 9 – CLAIMED → ESTABLISHED laundering**
+
+- **Scenario (a):**  
+  `E_claimed(A,B)` with a heuristic score = 0.99 is added by the ML engine.  
+  The evidence evaluator contains a legacy rule “if *any* evidence has
+  score > 0.95, treat it as a supporting witness.”  The `E_claimed`
+  edge is therefore accepted as a witness, bypassing the requirement that
+  `W` contain *signed* evidence nodes.  The policy engine promotes the
+  edge to `E_established(A,B)` and the application later issues an
+  `E_authorized` lease.
+- **What was missed:**  The design never distinguished *type* from *value* in the evidence‑acceptance logic; the term “evidence” was overloaded to include heuristic candidates.
+
+- **Hold (b) + mechanism:**  
+  If the implementation enforces that only nodes of type *Witness* (signed EATs, OAuth receipts, etc.) can populate `W`, and the evaluator explicitly rejects `E_claimed` edges regardless of score, the promotion path is closed.  The invariant is the strict type check in the *Evidence* constructor.
+
+**Kill‑Target 10 – Weight laundering via traversal priority**
+
+- **Scenario (a):**  
+  An attacker injects many malicious witnesses with a weight of 1.0 (max).  The witness collector is configured to process witnesses in descending weight order and stops after collecting `k` witnesses.  Legitimate witnesses with weight = 0.1 never get processed, so the policy, which requires a mix of witness types, is satisfied only by attacker‑controlled evidence.
+- **What was missed:**  The design assumes “priority” is *only* a scheduling aid; it does not account for resource limits or adversarial scheduling that can truncate the witness set.
+- **Hold (b) + mechanism:**  
+  If the collector is bounded by *time* rather than *count* and is guaranteed to process *all* witnesses that satisfy the policy’s minimal weight, the weight cannot be used as a covert channel.  The invariant is “every witness meeting the policy’s minimum weight must be evaluated before a decision”.
+
+**Kill‑Target 11 – Invalidation race (TOCTOU on revocation)**
+
+- **Scenario (a):**  
+  Revocation of `Key‑01` is committed to the log.  A client still holds an active `E_authorized` lease that was issued just before revocation.  The lease is exercised *before* the invalidation traversal propagates to the lease metadata, allowing the client to perform a privileged operation.  The window is bounded by the propagation delay of the DAG invalidation.
+- **What was missed:**  The claim that “same clock cycle” guarantees instant revocation ignores the *asynchronous* nature of distributed state updates and the fact that leases are validated in a separate read path.
+- **Hold (b) + mechanism:**  
+  If each lease carries a *lease‑token* that is re‑validated against the current witness state *at the moment of use* (e.g., a hash‑chained snapshot), then the lease becomes unusable as soon as any constituent witness is revoked.  The invariant is “use‑time re‑validation of all witness statuses”.
+
+**Kill‑Target 12 – Ghost clumping + one weak witness**
+
+- **Scenario (a):**  
+  Attacker creates a dense cluster of phantom identities `X1…Xn`.  For each, a weak witness (e.g., a single SMS OTP) is forged and accepted by the policy `P_financial`.  The policy’s rule “require ≥ 1 strong witness OR ≥ 2 weak witnesses” is satisfied, so the attacker’s `E_claimed` edges are promoted to `E_established` and then to `E_authorized`.  The epistemic firewall blocks purely heuristic merges, but the weak witness bypasses it.
+- **What was missed:**  The specification of which witness types are “strong” vs “weak” and the policy’s explicit acceptance criteria were left to deployment‑time configuration, exposing the policy to arbitrary compromises.
+- **Hold (b) + mechanism:**  
+  If the policy engine enforces a *signature* over the set of witness types that qualify as “strong” and requires that at least one such witness be *signed* by a trusted authority, then the weak‑witness attack cannot succeed.  The invariant is “every policy must list an unforgeable witness type set”.
+
+**Kill‑Target 13 – EQL tier confusion**
+
+- **Scenario (a):**  
+  An API client passes `tier='ESTABLISHED'` as a string to a query endpoint.  The planner’s string parser mistakenly normalizes unknown values to the default tier `CLAIMED`.  The query thus returns only `E_claimed` edges, and the application interprets them as established, allowing unauthorized access.
+- **What was missed:**  The design treats *tier* as a free‑form string; the query planner has no compile‑time type safety, so injection or misspelling can alter security semantics.
+- **Hold (b) + mechanism:**  
+  If the query language’s type system encodes `tier` as an enum and the planner rejects any value not in `{CLAIMED, ESTABLISHED, AUTHORIZED}`, the confusion is eliminated.  The invariant is “tier must be a statically‑verified enum value, not a user‑supplied string”.
+
+**Kill‑Target 14 – Primitive composition seams**
+
+- **Scenario (a):**  
+  A malicious actor constructs an *E_established* subgraph locally, embedding forged witness nodes.  The actor passes this subgraph to the `au` evaluator.  The evaluator trusts the caller’s subgraph structure and grants an `E_authorized` lease without consulting the immutable log.  The actor now holds a valid lease for resources it should not control.
+- **What was missed:**  The interface contract for `au` did not require that the subgraph be *re‑computed* from the append‑only journal; it allowed arbitrary caller‑supplied graphs.
+- **Hold (b) + mechanism:**  
+  If `au` internally reconstructs the subgraph by querying the append‑only state store and verifies that every edge in the graph is present and signed in the log, then a forged subgraph cannot be accepted.  The invariant is “the evaluator operates only on log‑derived subgraphs, not caller‑supplied ones”.
+
+---  
+
+**VERDICT:** The TIG design’s safety hinges on strict type enforcement, time‑bounded witness evaluation, and log‑derived subgraph verification; without these, each kill‑target can be breached.

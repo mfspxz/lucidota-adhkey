@@ -1,0 +1,271 @@
+We need to find bugs not in critique; i.e., vulnerabilities. Let's analyze code.
+
+Potential issues:
+
+- Identity struct allows arbitrary manipulation: no checks on History uniqueness? There's DuplicateEvent error but not used.
+
+- Sequence numbers: next_seq uses len+1; but during recover, they do next_seq before recording RecoveryCompleted, but also activate new key uses next_seq after record: may cause duplicate seq? Let's see: In recover, they call record RecoveryCompleted then activate_key which does record KeyActivated (next_seq). So seq increments appropriately.
+
+- The recover function: old key must exist and not Revoked; but old could be Lost. They don't check that old key state is usable? They allow revoking lost key. But old key may be Expired or Lost. They allow revoking if old.state != Revoked? They check if old.state == Revoked => error. So Revoked or Active or Lost or Expired fine.
+
+- They enforce approvals: policy keys must be in recovery_key_ids and usable. Good.
+
+- But they don't check that new_key not already in keys? activate_key checks if key exists; so new_key must not exist.
+
+- But they don't check that new_purpose matches requested? Not relevant.
+
+- Potential bug: RecoveryCompleted event stores approvals: counted.len(); but approvals may be > threshold, but okay.
+
+- No check for duplicate event seq? DuplicateEvent error unused.
+
+- In verify_capability, Outcome passes or fails but no check for Replay of nonce? They check seen_nonces set. But seen_nonces is a mutable BTreeSet. But VerifierContext holds &mut BTreeSet; but the function receives &mut VerifierContext; after returning, the set persists. In tests maybe.
+
+- However, KeyKnown check uses identity.key_state, but doesn't check that key exists? It does.
+
+- Issue: In verify_capability, they ignore key_state in checks for non-usable? They set failed=Some(Error::KeyNotUsable). But still continue to other checks? They don't early exit. So if key is not usable, they still may set other checks but fail at end. That may be okay.
+
+- Potential bug: In verify_capability, they ignore that key may be Revoked or Lost? They only check usable. Revoked or Lost not usable, so fail.
+
+- But they don't check that key purpose matches expected; they get purpose_ok using identity.keys. Good.
+
+- But they don't check that key is part of the identity's keys? They check key_state via key_state() earlier: that uses get(id). Good.
+
+- The `SignatureValid` check is just a boolean from context. No actual cryptographic verification. But that's okay as placeholder.
+
+- Potential bug: In `Identity::active_keys`, they return references to KeyRecord; but key records are stored in BTreeMap; fine.
+
+- In `KeyRecord`, seq field but not used in logic.
+
+- The `KeyId` type is just string. No canonicalization; collisions may exist.
+
+- In `RecoveryPolicy::valid`, they check threshold >= 1, <= len, and not empty. Good.
+
+- In `RecoveryPolicy`, no check for uniqueness of ids; could allow duplicates. But duplicates might be counted by BTreeSet, but duplicates could artificially inflate approvals? But BTreeSet dedup.
+
+- Overlap: In recover, they iterate approvals, check each against policy.ids; duplicates counted once. So fine.
+
+- The `KeyState::can_transition_to` allows transitions: (Active, Lost), (Active, Revoked), (Active, Expired), (Lost, Active), (Lost, Revoked). But it does not allow (Active, Active) or (Revoked, ...) etc. Good.
+
+- But it allows (Lost, Revoked) but not (Revoked, Lost). So once revoked cannot be found again. Good.
+
+- In transition_key: if next is Active, it records KeyFound. But if key was Lost, we may call transition to Active. Works.
+
+- But transition_key doesn't check that key is not Revoked or Expired? But can_transition_to ensures that. For Revoked cannot transition to Active. Good.
+
+- But transition_key also doesn't check that reason string used only for Revoked. But fine.
+
+- Potential bug: In `recover`, they call activate_key after recording RecoveryCompleted. But activate_key will record KeyActivated; but if activate_key fails (e.g., key already exists) it returns Err but recover already recorded RecoveryCompleted; state inconsistent. But recover fails after activation? They call activate_key and propagate error. But RecoveryCompleted event already recorded; inconsistent state. Should be atomic. The critique #9. But we need to find bugs not in critique. But this is a bug; but critique already caught it? #9 is about non-atomic recovery. So we skip.
+
+- Other bug: In `VerifierContext`, signature_valid is bool; no check of the signature. But maybe that's placeholder.
+
+- In `verify_capability`, they do `let failed: Option<Error> = None;` and then after each check, if failed.is_none() they set failed. But they don't short-circuit. So if multiple errors, only first sets failed. Good.
+
+- But they still push all checks that pass or fail? They push check for KeyKnown, KeyUsable, PurposeMatches etc. But if a check fails, they still push? e.g., if key not usable, they set failed but still push? They do:
+
+```
+if key_state.usable() {
+    checks.push(Check::KeyUsable);
+} else {
+    failed = Some(Error::KeyNotUsable(...));
+}
+```
+
+They don't push KeyUsable, but don't push KeyUsable? That's fine.
+
+- But if key usable but purpose mismatch, they push PurposeMatches? No, they push only if matches.
+
+- The receipt's outcome is Pass if failed.is_none.
+
+- The receipt includes all checks that passed? In case of failure, it includes checks up to failure? Actually they push only passes, but may not include failed checks. So receipt may not contain the failed check. But that's okay.
+
+- Potential bug: In `verify_capability`, they compute `key_state` but in `fail_receipt`, they ignore ctx, but they pass key_state as param. That's fine.
+
+- In `KeyRecord.seq`, they use next_seq to assign. But seq increments per event; but key seq not used anywhere else. Not problematic.
+
+- In `Identity::key_state`, returns Option<KeyState>. But in verify, they use that.
+
+- In `KeyState` enum: Expired is not used except in transition and in verification.
+
+- In `KeyState::can_transition_to`, they allow (Lost, Active) but not (Active, Lost) ??? Wait matches: (Active, Lost) is allowed. Good.
+
+- But missing transition from Active to Lost? Already allowed. But missing from Revoked to Lost? Not allowed. But maybe fine.
+
+- Another bug: In `activate_key`, they check if id.keys.contains_key(&key) then return IllegalTransition(KeyState::Active, KeyState::Active). That's weird: they treat key exists as illegal transition from Active to Active, but not precise. But bug: They don't check if key already exists but in Revoked or Lost etc. If key exists but is Revoked, activate_key will error incorrectly. But you might want to re-activate a key after revocation? But spec doesn't allow. That's fine.
+
+- Potential bug: In `RecoveryPolicy::valid`, threshold <= len ensures threshold <= number of keys. But if threshold=0? They also check >=1, so threshold 0 invalid. Good.
+
+- In `Identity::active_keys`, returns Vec<&KeyRecord>. But if many keys, returns references; fine.
+
+- In `Claimed`, `Established`, etc., they wrap type T; not problematic.
+
+- In `Evidence`, digest is [u8;32] but no canonical encoding. But critique covers that.
+
+- In `HumanClaim::evaluate_claim`, they check revocation first. But they don't check that evidence that revokes is from same witness? But okay.
+
+- In `HumanClaim::evaluate_claim`, they treat any revoked evidence as revocation, but could be revocation of some evidence that is not the one establishing claim; but fine.
+
+- In `authorize_with_freshness`, they check max_staleness_secs and now - known_at <= threshold else AuthorizedAsOf. Good.
+
+- Potential bug: In `verify_capability`, they check key known and key usable and purpose matches etc, but they don't check that the key's purpose matches expected_purpose? They do purpose_ok. Good.
+
+- But they don't check that the key is not revoked or lost? They check usable; but if key is Revoked or Lost, usable false, fails.
+
+- In `VerifierContext`, they store `signature_valid` bool. But they don't check that signature is correct for the key; but that's placeholder.
+
+- In `Capability`, there's nonce, issued_at, expires_at. But no check that nonce unique? In verify, they check seen_nonces.
+
+- However, `receipt` includes key_state (state that existed at check). But after verifying, the key could change state before use. But that's okay.
+
+- Potential bug: In `recover`, after revoking old key and recording RecoveryCompleted, they call activate_key for new key. But if activate_key fails, e.g., key already exists, the RecoveryCompleted event is already recorded, leading to inconsistent state. Already noted.
+
+- Another bug: In `recover`, they don't check that approvals are distinct? They dedup via BTreeSet. Good.
+
+- In `activate_key`, they don't check that key purpose is known? But they accept any.
+
+- In `KeyState::can_transition_to`, they don't allow transition from Lost to Lost? Not needed.
+
+- Another bug: In `Identity` struct, `verification_methods` is Vec<VerificationMethod>; but not used anywhere. No issue.
+
+- In `VerifierContext`, they have `now` field; but not used in signature_valid. Good.
+
+- In `Capability`, `nonce` is String; but no length limit. Could be huge leading to memory blow? Not significant.
+
+- But potential bug: In `VerifierContext`, `seen_nonces` is a &mut BTreeSet<String>; but no lifetime checks ensure that it outlives the context? It's fine.
+
+- Another bug: In `verify_capability`, they call `if let Some(s) => { checks.push(Check::KeyKnown); s }` else error; but if key known, they push Check::KeyKnown. But they don't record check if key known but maybe key revoked? They later check KeyUsable. Good.
+
+- But they don't check that the key id is known before retrieving key purpose? They use identity.keys.get(&cap.key_id) again; but if key missing, they would get None; but they already had key_state via key_state(); if key unknown, error earlier. So fine.
+
+- Potential bug: In `verify_capability`, they treat `purpose_ok` by calling identity.keys.get(&cap.key_id).map(|k| k.purpose == expected_purpose).unwrap_or(false); If key missing, purpose_ok false. But they already error earlier. So fine.
+
+- In `verify_capability`, they check `cap.subject == expected_subject`. But subject is a struct containing string; equality works.
+
+- In `VerifierContext`, they have `_signed_message: &'a [u8]`. Not used. But fine.
+
+- In `KeyRecord`, seq is u64; but not used.
+
+- In `Event::RecoveryCompleted`, approvals: usize. But they don't check duplicates earlier. They count distinct approvals.
+
+- Potential bug: In `Event::RecoveryCompleted`, they don't check that old_key exists? They do earlier. But they don't check that new_key not in keys. activate_key will error if new exists.
+
+- Another bug: In `Event::RecoveryCompleted`, they store approvals: counted.len(); But counted is BTreeSet. Good.
+
+- Potential bug: In `KeyState::can_transition_to`, they allow (Lost, Active) but not (Lost, Revoked). They do allow (Lost, Revoked). Good.
+
+- Another bug: In `KeyState::usable`, matches only Active; Expired, Lost, Revoked not usable. Good.
+
+- In `Event`, they use seq: u64. But next_seq uses len+1. But if events removed? Not.
+
+- Another bug: In `Identity::history`, they store Vec<Event>. DuplicateEvent error not used. So duplicate events possible. But critique covers.
+
+- Another bug: In `Identity::active_keys`, returns Vec<&KeyRecord> by filtering. But they don't sort; but BTreeMap sorted by KeyId.
+
+- Another bug: In `KeyId`, no validation of string. Accept any.
+
+- Another bug: In `KeyRecord`, seq is set but not used.
+
+- Another bug: In `Capability`, they don't include signature. But signature handled elsewhere.
+
+- Another bug: In `Authorized`, they store capability: Capability. But they also store value: Capability. So duplicate. Not issue.
+
+- Another bug: In `Receipt`, they have key_state: KeyState. But if key is revoked after receipt? Not relevant.
+
+- Another bug: In `AuthorizationVerdict`, they store String for CannotEstablish; could use error type.
+
+- Another bug: In `HumanClaim`, they store issued_by: Witness. But not used.
+
+- Potential bug: In `evaluate_claim`, they don't check for conflict. But critique covers.
+
+- Another bug: In `HumanClaim`, they don't check that issued_at <= now <= expires_at. But evaluate_claim will check expiration.
+
+- Another bug: In `authorize_with_freshness`, they don't check that state is Established? They check authorizable. But if state is Established but not fresh, they return AuthorizedAsOf. That's okay.
+
+- Another bug: In `verify_capability`, they don't check `nonce` uniqueness across capabilities? They use seen_nonces set. Good.
+
+- Potential bug: In `VerifierContext`, they store `signature_valid` as bool. But if signature is invalid, they return error. Good.
+
+- Another bug: In `VerifierContext`, they don't specify that signature_valid must be computed via cryptographic verification; but placeholder.
+
+- Potential bug: In `VerifierContext`, they don't check that `now` is non-decreasing? Not needed.
+
+- Another bug: In `verify_capability`, they don't check that `cap.key_id` refers to a key that is not revoked? They check usable; revoked not usable. Good.
+
+- Another bug: In `verify_capability`, they don't check that the key is not expired? Expired not usable. Good.
+
+- Another bug: In `verify_capability`, they don't check that the capability is not revoked? Not relevant.
+
+- Another bug: In `VerifierContext`, they don't check that the `_signed_message` is not reused? Not relevant.
+
+- Another bug: In `Capability`, they don't include signature; but signature is stored elsewhere. Not bug.
+
+- Another bug: In `Capability` struct, `scope` string is used but no validation. Not bug.
+
+- Another bug: In `Capability`, `audience`: string. No check. Not bug.
+
+- Another bug: In `Capability`, `issued_at` and `expires_at` are u64; no check that expires > issued. Not bug.
+
+- Another bug: In `Capability`, `nonce`: string; no uniqueness beyond the seen_nonces set.
+
+- Another bug: In `HumanClaim`, `issued_at`, `expires_at` fields. No validation.
+
+- Another bug: In `HumanClaim`, `state` field is EpistemicState; but evaluate_claim might return new state but they don't update. But not bug.
+
+- Another bug: In `Evidence`, digest is [u8;32]; but no canonicalization.
+
+- Another bug: In `Witness`, trust_domain field but no validation.
+
+- Another bug: In `AuthorizationRequest`, fields but not used.
+
+- Another bug: In `HumanClaim::evaluate_claim`, they check if any evidence revoked: if any revoked -> Revoked. But they don't check that revoked evidence is from the same witness as the claim? But not bug.
+
+- Another bug: In `HumanClaim`, `evidence` vec maybe empty; but evaluate_claim returns Claimed.
+
+- Another bug: In `HumanClaim`, `issued_by` is Witness; but not used.
+
+- Another bug: In `KeyId`, no length restrictions.
+
+- Another bug: In `RecoveryPolicy`, no check that recovery_key_ids are unique; duplicates could reduce threshold? But BTreeSet dedup.
+
+- Another bug: In `KeyPurpose`, no check that purpose matches usage.
+
+- Another bug: In `KeyState::can_transition_to`, they allow (Lost, Revoked) but not (Lost, Expired). So cannot expire a lost key. But maybe fine.
+
+- Another bug: In `KeyState::can_transition_to`, they allow (Active, Expired). Good.
+
+- Another bug: In `KeyState::can_transition_to`, they allow (Active, Lost) and also allow (Active, Revoked). But they also allow (Active, Expired). Good.
+
+- Another bug: In `KeyState::can_transition_to`, they allow (Lost, Active). Good.
+
+- Another bug: In `KeyState::can_transition_to`, they allow (Lost, Revoked). Good.
+
+- Another bug: In `KeyState::can_transition_to`, they don't allow (Expired, Lost) etc. But maybe fine.
+
+- Another bug: In `KeyState::usable`, Expired not usable. Good.
+
+- Another bug: In `Identity::history`, duplicate events possible; but critique covers.
+
+- Another bug: In `Identity::key_state`, they return Option<KeyState> but not seq. Not bug.
+
+- Another bug: In `Identity`, there is no method to derive state from history; but not bug.
+
+- Another bug: In `KeyRecord`, seq is set but not used. Not bug.
+
+- Another bug: In `Event::RecoveryCompleted`, approvals: usize; but no check that approvals <= threshold. They count later.
+
+- Another bug: In `Identity::active_keys`, they filter for key.state.usable(); but they don't check purpose. They take purpose param. Good.
+
+- Another bug: In `KeyRecord`, seq: u64; but not used.
+
+- Another bug: In `ActivationKey`, they create event with seq; but they don't include key purpose? They do.
+
+- Another bug: In `ActivationKey`, they don't update seq for existing keys. Good.
+
+- Another bug: In `Identity`, `identifier` is a string; no validation. But not bug.
+
+- Another bug: In `Identity`, `subject` can be arbitrary string. Not bug.
+
+- Another bug: In `Identity`, `verification_methods` not used.
+
+- Another bug: In `Identity`, `recovery_policy` not validated on creation. But could be invalid; but functions check.
+
+- Another bug: In `Identity`, `history` starts empty; but no event for

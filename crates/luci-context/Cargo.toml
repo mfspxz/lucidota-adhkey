@@ -1,0 +1,10 @@
+[package]
+name = "luci-context"
+version = "0.1.0"
+edition = "2021"
+description = "luci-context: epistemic context cache. Compress by truth/provenance/decision-relevance, never destroy information. CAS-backed reconstruction."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+luci-verdict-core = { path = "../luci-verdict-core" }
+sha2 = "0.10"

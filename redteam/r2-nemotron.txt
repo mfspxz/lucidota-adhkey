@@ -1,0 +1,25 @@
+## 1. Statement self-authority — **BROKEN**
+
+**Exploit:** `authenticate()` verifies only chain continuity and signature validity. It performs **zero authorization checks**. Any keyholder can issue `Controls`, `Authorizes`, or `Attests` statements for any subject.
+
+```rust
+// Attack: Mallory creates genesis statement for Victim's subject
+let mallory = subj("attacker", "mallory");
+let victim = subj("victim", "alice");
+let mut s = Statement {
+    subject: victim.clone(),
+    predicate: Predicate::Controls,
+    object: Object::Key(KeyRef([0x42; 32])), // Mallory's key
+    issuer: mallory,                          // NOT victim
+    evidence: vec![],
+    policy: "".into(),
+    timestamp: 1,
+    sequence: 0,
+    previous: [0u8; 32],
+    signature: mallory_sign(&canonical_bytes(&s)), // valid sig by Mallory
+    suite: "ed25519".into(),
+};
+let auth = authenticate(s, None, verify_mallory_key).unwrap(); // ACCEPTED
+```
+
+**Mechanism missing:** No check that `issuer` appears in `derived.controls[subject]` (or any authorization predicate) before accepting statement effects. The model conflates "signed

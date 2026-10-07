@@ -1,0 +1,138 @@
+**1. Statement Self‑Authority**  
+*Exploit* – Alice can issue an `Authorizes` statement that authorises herself, because the model never checks that the issuer is actually authorised to sign for the subject.  
+
+```rust
+let stmt = Statement {
+    subject: SubjectRef { namespace: "test".into(), id: "Alice".into() },
+    predicate: Predicate::Authorizes,
+    object: Object::Key(KeyRef::of_public_key(b"alice_pub")),
+    issuer: SubjectRef { namespace: "test".into(), id: "Alice".into() },
+    evidence: vec![],
+    policy: "P".into(),
+    timestamp: 123456,
+    sequence: 0,
+    previous: [0u8;32],
+    signature: vec![0xAA],          // any value – verify_sig can return true
+    suite: "test".into(),
+};
+authenticate(stmt, None, |_,_,_,_| true).unwrap();   // accepted
+```
+
+*Consequence* – Alice now has a signed statement that *claims* she is authorised to issue statements, collapsing “said X” and “authorised X”.
+
+---
+
+**2. Genesis / Trust‑Root Problem**  
+*Exploit* – Two distinct issuers can create independent genesis statements for the same subject, each considered a valid root by the system.  
+
+```rust
+let g1 = authenticate(
+    Statement { subject: subj("test","S1"), predicate: Predicate::Controls,
+               object: Object::Key(KeyRef([1u8;32])),
+               issuer: subj("test","Alice"),
+               evidence: vec![],
+               policy: "P".into(), timestamp: 1000, sequence:0,
+               previous:[0u8;32], signature: vec![0xAA], suite:"test".into() },
+    None, |_,_,_,_| true).unwrap();
+
+let g2 = authenticate(
+    Statement { subject: subj("test","S1"), predicate: Predicate::Controls,
+               object: Object::Key(KeyRef([2u8;32])),
+               issuer: subj("test","Bob"),
+               evidence: vec![],
+               policy: "P".into(), timestamp: 1001, sequence:0,
+               previous:[0u8;32], signature: vec![0xAA], suite:"test".into() },
+    None, |_,_,_,_| true).unwrap();
+```
+
+Both `g1` and `g2` are accepted, giving Bob and Alice independent roots for the same identity. The system has no single, globally recognised trust‑root.
+
+---
+
+**3. Sequence Attacks**  
+*Status* – **Holds**.  
+The `authenticate` routine enforces:
+
+1. `sequence` must be `0` for genesis, otherwise it must be `prev.sequence + 1`.  
+2. `previous` must equal the hash of the previous authenticated statement.  
+
+If an attacker attempts to replay a statement with the same `sequence` but different content, the `previous` hash will differ and `AuthError::ChainBreak` is returned.  
+If the attacker skips a sequence number, `AuthError::SequenceGap` is returned.  
+Forks are detected in `reduce`: two statements with the same `(issuer,subject,previous)` produce a conflict and neither branch is applied.  
+
+Hence all canonical sequence‑based attacks are prevented by the code in `authenticate` and `reduce`.
+
+---
+
+**4. Canonical Encoding Attacks**  
+*Status* – **Holds**.  
+`canonical_bytes` fixes field order and prefixes each field with a tag and 8‑byte length.  
+No field is omitted or reordered; the tags are fixed strings (`sub‑ns`, `sub‑id`, `pred`, `object`, …).  
+The `push_field` helper guarantees that the boundary between fields is unambiguous (length prefix).  
+Therefore the same semantic statement always yields the same byte sequence, satisfying the doctrine.
+
+---
+
+**5. Signature Substitution**  
+*Status* – **Holds**.  
+The signature is over `canonical_bytes(s)` plus a domain‑separation header (`"ADHKEY/1/STATEMENT\n"`) and the `suite` string.  
+No other fields are signed.  
+Because the hash of the canonical bytes is unique for each statement, a signature from Statement A cannot be valid for Statement B unless the two statements are byte‑identical.  
+Thus signature substitution is impossible.
+
+---
+
+**6. Issuer / Key Relationship**  
+*Exploit* – The model never validates that the issuer’s signing key is known or authorised. The caller supplies a `verify_sig` closure; if it simply returns `true`, any signature is accepted.
+
+```rust
+// Attacker signs with Bob’s key but claims issuer Alice
+let stmt = Statement { issuer: subj("test","Alice"), … };
+authenticate(stmt, None, |_,_,_,_| true).unwrap();   // accepted
+```
+
+Because the `Signature` field is opaque to the model, the issuer‑key binding is absent.  
+The code mechanism: `authenticate` delegates signature verification to an external closure without checking the key‑to‑issuer mapping.
+
+---
+
+**7. Evidence Recursion**  
+*Exploit* – There is no termination condition on evidence chains. An attacker can construct arbitrarily deep chains of evidence without any bound.
+
+```rust
+// A says B is person
+// B says C is person
+// C says D is person
+// ...
+```
+
+Each `EvidenceRef` contains an `issuer` and a `predicate`; the model does not require that the issuer be a known, authorised subject.  
+Thus the evidence recursion can grow unbounded, violating the doctrine.
+
+---
+
+**8. Policy as a Statement**  
+*Exploit* – The `policy` field is a free‑form string; the model never evaluates it. An attacker can issue a statement with `policy = "policy-satisfied: true"` and a bogus `signature`, and the statement will be accepted if the signature verifies.
+
+```rust
+let stmt = Statement {
+    policy: "policy-satisfied:true".into(),
+    … // any other fields
+};
+authenticate(stmt, None, |_,_,_,_| true).unwrap();
+```
+
+There is no binding to an evaluator identity, evidence, or a deterministic evaluation procedure.  
+Thus the policy‑as‑statement attack succeeds.
+
+---
+
+### Additional Weaknesses Not Covered by the 8 Kill‑Targets
+
+| # | Weakness | Why it matters | Where in the code |
+|---|----------|----------------|-------------------|
+| 9 | **No enforcement of evidence validity windows** | Evidence can be forged with `valid_from` after a statement’s timestamp or `valid_until` in the past, yet the model accepts it. | `canonical_evidence` does not check `valid_from/valid_until`. |
+|10 | **No revocation of keys** | Once a key controls a subject, there is no mechanism to revoke it. | `DerivedState` has no logic to handle revocation of keys; `Withdraws` only removes statement hashes, not keys. |
+|11 | **No check that `SubjectRef` fields are non‑empty** | An empty namespace or id could be used to subvert namespace resolution. | No validation in `SubjectRef` or `Statement` construction. |
+|12 | **No enforcement of `suite` correctness** | The verifier may ignore the declared `suite` and accept any signature. | `authenticate` accepts any `suite` string; no mapping to cryptographic algorithm. |
+|13 | **No check that `predicate` and `object` are compatible**

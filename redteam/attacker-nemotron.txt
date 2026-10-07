@@ -1,0 +1,325 @@
+Let me analyze this codebase thoroughly for security bugs that the 22-point critique missed. I need to read the actual code carefully and find issues beyond what's already documented.
+
+Let me start by understanding the codebase structure:
+
+1. **adhkey-core** - Core types, lifecycle state machine, verifier, evidence graph, court tests
+2. **adhkey-crypto** - Ed25519 and SHA-256 primitives
+3. **adhkey-store** - KeyStore trait for storage adapters
+
+The critique (22 points) and AUDIT.md (C1-C7, G1-G5) already cover many issues. I need to find NEW issues not covered by either.
+
+Let me go through the code systematically.
+
+## TASK A: Find security bugs the 22-point critique MISSED
+
+### Looking at lib.rs (core types):
+
+1. **KeyId(pub String)** - Already criticized in #4 as underspecified label
+2. **Subject(pub String)** - Already criticized in #5
+3. **KeyState transitions** - Let me check the transition logic carefully
+
+```rust
+pub fn can_transition_to(&self, next: KeyState) -> bool {
+    use KeyState::*;
+    matches!(
+        (self, next),
+        (Active, Lost)
+            | (Active, Revoked)
+            | (Active, Expired)
+            | (Lost, Active) // found again
+            | (Lost, Revoked)
+    )
+}
+```
+
+Issues:
+- **Lost → Active** allowed unconditionally (C6 in AUDIT.md mentions this)
+- **No Expired → anything** - Expired is terminal? But not explicitly stated
+- **Revoked is terminal** - correctly no transitions from Revoked
+
+Wait, the critique #3 says "ESTABLISHED at T0, revoked at T2, executed at T3. Need VALID_AT vs VALID_DURING vs AUTHORIZED_FOR_EXECUTION." This is about time-bounded validity, not just state transitions.
+
+4. **RecoveryPolicy.valid()** - checks threshold >= 1 && threshold <= recovery_key_ids.len() && !recovery_key_ids.is_empty()
+   - What if threshold == 0? It's rejected by >= 1
+   - What if recovery_key_ids has duplicates? BTreeSet in recover() handles counting distinct, but the policy itself could have duplicates
+
+5. **Identity struct** - has `history: Vec<Event>` which is mutable (critique #2)
+6. **Event enum** - no cryptographic binding, no signatures (critique #2, #15)
+
+### Looking at lifecycle.rs:
+
+```rust
+fn next_seq(id: &Identity) -> u64 {
+    id.history.len() as u64 + 1
+}
+```
+
+**BUG: Sequence number based on history length** - This is fragile. If history is manipulated (events removed), seq numbers can collide or go backwards. The critique #2 mentions "history isn't history" but this specific bug (seq = len + 1) isn't explicitly called out as a TOCTOU/integrity issue.
+
+```rust
+pub fn recover(
+    id: &mut Identity,
+    old_key: &KeyId,
+    new_key: KeyId,
+    new_purpose: KeyPurpose,
+    approvals: &[KeyId],
+) -> Result<(), Error> {
+    // ...
+    // Revoke the old key (from whatever state it was in).
+    let seq = next_seq(id);
+    if let Some(rec) = id.keys.get_mut(old_key) {
+        rec.state = KeyState::Revoked;
+    }
+    record(
+        id,
+        Event::RecoveryCompleted {
+            old_key: old_key.clone(),
+            new_key: new_key.clone(),
+            approvals: counted.len(),
+            seq,
+        },
+    );
+    activate_key(id, new_key, new_purpose)?;
+    Ok(())
+}
+```
+
+**BUG: Non-atomic recovery** - Critique #9 and C2 cover this. The old key is revoked, then event recorded, then new key activated. If activate_key fails (e.g., duplicate key), the old key is already revoked but no RecoveryCompleted event for the new key? Actually activate_key would fail if key exists, but the old key is already revoked. This leaves identity in inconsistent state.
+
+Wait, `activate_key` checks `if id.keys.contains_key(&key)` and returns error. But the old key was already revoked. So if `new_key` already exists, recovery fails but old key is already revoked. That's a state corruption bug.
+
+**BUG: Recovery can leave identity with revoked old key but no new key activated** - If `activate_key` fails (e.g., new_key already exists), the function returns error but old_key is already revoked and RecoveryCompleted event already recorded. The identity is now in a broken state.
+
+Let me verify: `activate_key` is called AFTER `record(id, Event::RecoveryCompleted...)`. So the event is recorded, old key revoked, then new key activation attempted. If activation fails, we have a recorded recovery event but no new key. The old key is revoked. Identity is broken.
+
+This is a **CRITICAL** bug not explicitly called out in the critique (critique #9 says "mutate-mutate-mutate-hope" but doesn't specify this exact failure mode).
+
+```rust
+pub fn activate_key(
+    id: &mut Identity,
+    key: KeyId,
+    purpose: KeyPurpose,
+) -> Result<(), Error> {
+    if id.keys.contains_key(&key) {
+        return Err(Error::IllegalTransition(KeyState::Active, KeyState::Active));
+    }
+    // ...
+}
+```
+
+**BUG: Duplicate key detection uses wrong error** - Returns `IllegalTransition(KeyState::Active, KeyState::Active)` but the key might not be Active (could be Lost, Revoked, Expired). The error message is misleading and doesn't distinguish between "key already exists in any state" vs "key already Active".
+
+### Looking at verifier.rs:
+
+```rust
+pub fn verify_capability(
+    ctx: &mut VerifierContext<'_>,
+    claimed: Claimed<Capability>,
+    expected_subject: &Subject,
+    expected_audience: &str,
+    expected_purpose: KeyPurpose,
+) -> Result<Established<Capability>, (Error, Receipt)> {
+    // ...
+    // Purpose matches?
+    let purpose_ok = ctx
+        .identity
+        .keys
+        .get(&cap.key_id)
+        .map(|k| k.purpose == expected_purpose)
+        .unwrap_or(false);
+    // ...
+}
+```
+
+**BUG: Purpose check uses unwrap_or(false)** - If key not found, returns false, but earlier KeyKnown check would have failed. However, there's a TOCTOU: between KeyKnown check and PurposeMatches check, the identity could be modified (if shared mutable reference). But Identity is `&'a Identity` (immutable reference), so not directly mutable. However, if using interior mutability or multiple threads...
+
+Actually, `VerifierContext` takes `identity: &'a Identity` - immutable reference. So no TOCTOU from mutation during verification. But the critique #3 mentions TOCTOU identity machine - ESTABLISHED at T0, revoked at T2, executed at T3. This is about time-of-check vs time-of-use across different operations, not within a single verification.
+
+```rust
+// Nonce fresh? (the verifier owns the seen-set — caller can't replay)
+if ctx.seen_nonces.insert(cap.nonce.clone()) {
+    checks.push(Check::NonceFresh);
+} else if failed.is_none() {
+    failed = Some(Error::InvalidPolicy("nonce replay".into()));
+}
+```
+
+**BUG: Nonce replay protection is per-verifier-instance** - The `seen_nonces` is passed in by caller. If caller creates new `BTreeSet` each time, replay protection is bypassed. The comment says "the verifier owns this" but the verifier doesn't enforce ownership - caller controls it. This is C5 in AUDIT.md ("Replay protection is RAM-only") but the specific issue that **caller can bypass by passing fresh set** is not explicitly called out.
+
+```rust
+// Signature valid? (reported by the store, not the caller)
+if ctx.signature_valid {
+    checks.push(Check::SignatureValid);
+} else if failed.is_none() {
+    failed = Some(Error::InvalidPolicy("signature invalid".into()));
+}
+```
+
+**BUG: signature_valid is a bool passed by caller** - C1 in AUDIT.md covers this. But additionally, `_signed_message: &'a [u8]` is never used! The signature validation doesn't even check that the signature is over the correct message. The store's `verify` function takes `(message, sig)` but here we just trust a boolean.
+
+### Looking at evidence.rs:
+
+```rust
+pub fn evaluate_claim(claim: &HumanClaim, now: u64) -> EpistemicState {
+    // Revocation is sticky and checked first.
+    if claim.evidence.iter().any(|e| e.revoked) {
+        return EpistemicState::Revoked;
+    }
+    if let Some(exp) = claim.expires_at {
+        if now >= exp {
+            return EpistemicState::Expired;
+        }
+    }
+    if claim.evidence.is_empty() {
+        return EpistemicState::Claimed;
+    }
+    // Expired evidence does not count toward support.
+    let live: Vec<&Evidence> = claim
+        .evidence
+        .iter()
+        .filter(|e| e.expires_at.map(|x| now < x).unwrap_or(true))
+        .collect();
+    if live.is_empty() {
+        return EpistemicState::Claimed;
+    }
+    // Policy evaluation: the policy names a minimum evidence bar.
+    // The core does not know what "medium" means — the policy does.
+    // Here: SUPPORTED unless the policy's bar is met AND no conflict.
+    // Conflict detection: two live evidence items from different witnesses
+    // disagreeing is out of scope for the core; witnesses report conflict
+    // via revocation. A policy hook can upgrade this.
+    let _ = &live;
+    EpistemicState::Supported
+}
+```
+
+**BUG: No conflict detection despite Conflict state existing** - C4 in AUDIT.md covers this ("Conflict is dead"). But also: the comment says "witnesses report conflict via revocation" - but revocation is per-evidence, not per-claim. Two pieces of evidence from different witnesses could contradict each other without either being revoked.
+
+**BUG: Evidence digest never verified** - G5 in AUDIT.md covers this.
+
+**BUG: `establish` function takes `policy_satisfied: bool`** - C3 in AUDIT.md covers this.
+
+```rust
+pub fn authorize_with_freshness(
+    state: EpistemicState,
+    freshness: Option<&Freshness>,
+    max_staleness_secs: u64,
+    now: u64,
+) -> AuthorizationVerdict {
+    if !state.authorizable() {
+        return AuthorizationVerdict::CannotEstablish(format!(
+            "epistemic state {:?} is not authorizable",
+            state
+        ));
+    }
+    match freshness {
+        None => AuthorizationVerdict::CannotEstablish(
+            "no freshness witness; cannot establish current authority".into(),
+        ),
+        Some(f) => {
+            if now.saturating_sub(f.known_at) <= max_staleness_secs {
+                AuthorizationVerdict::Authorized
+            } else {
+                AuthorizationVerdict::AuthorizedAsOf(f.known_at)
+            }
+        }
+    }
+}
+```
+
+**BUG: Freshness witness not verified** - G3 in AUDIT.md covers this. But also: `f.state_version` is never checked against anything. The version is accepted but not validated.
+
+**BUG: `max_staleness_secs` used with `saturating_sub`** - If `now < f.known_at` (clock skew), `saturating_sub` returns 0, which is <= max_staleness_secs, so it returns `Authorized`. A future-dated freshness attestation would be treated as fresh. This is a clock skew vulnerability.
+
+### Looking at court.rs (tests):
+
+The tests are good but they test the current (buggy) behavior. Some tests might assert less than they promise.
+
+```rust
+#[test]
+fn court_key_substitution() {
+    // ...
+    // And the legitimately-added KEY-99 verifies (it IS this identity's key):
+    let mut nonces2 = BTreeSet::new();
+    cap.nonce = "nonce-099".into();
+    assert!(verify(&id, &mut nonces2, cap, true).is_ok());
+}
+```
+
+This test shows that ANY key added to the identity verifies - there's no binding between the key and the subject beyond being in the same Identity struct. But that's by design (the identity IS the collection of keys).
+
+### Looking at crypto.rs:
+
+```rust
+pub fn signing_key_from_seed(seed: &[u8; 32]) -> SigningKey {
+    SigningKey::from_bytes(seed)
+}
+```
+
+**BUG: No `generate()` function** - C17 in critique mentions this: "Provide `generate()` (CSPRNG) + explicit low-level `from_seed()`". The code only has `from_seed`, inviting `[0u8; 32]` usage.
+
+### Looking at store.rs:
+
+```rust
+pub trait KeyStore {
+    fn public_key(&self, id: &KeyId) -> Result<PublicKey, StoreError>;
+    fn sign(&self, id: &KeyId, message: &[u8]) -> Result<Signature, StoreError>;
+}
+```
+
+**BUG: No domain separation in signing** - Critique #20 mentions this. The trait doesn't include any domain/context parameter. Adapters must handle domain separation themselves, but there's no guidance or enforcement.
+
+**BUG: PublicKey and Signature are opaque Vec<u8>** - No algorithm identification. Critique #18 mentions this.
+
+### Additional issues I'm finding:
+
+1. **Recovery policy validation doesn't check for duplicate key IDs** - `RecoveryPolicy::valid()` doesn't check uniqueness of `recovery_key_ids`. If policy has `[REC-1, REC-1, REC-2]` with threshold=2, the `BTreeSet` in `recover()` would count only 1 distinct key, but the policy says 3 keys. This is a configuration footgun.
+
+2. **No validation that recovery keys are distinct from active keys** - A key could be both an authentication key and a recovery key. The protocol doesn't forbid this, but it might be a security issue (key compromise affects both).
+
+3. **`KeyRecord.seq` is per-key but `Event.seq` is global** - The `KeyRecord.seq` is set at activation and never updated. The `Event.seq` is global history sequence. This inconsistency could cause confusion.
+
+4. **`Identity.identifier` and `Identity.subject` are both Strings** - No validation they match or are well-formed. Critique #1, #5 cover this partially.
+
+5. **`VerificationMethod.public_key_multibase` is String** - No validation it's valid multibase. Could be garbage.
+
+6. **`Capability.nonce` is String** - No length limit, could be huge (DoS via memory in seen_nonces).
+
+7. **`RecoveryCompleted` event stores `approvals: usize`** - Critique #10 covers this ("approvals: usize destroys provenance").
+
+8. **No replay protection for recovery operations** - The recovery function doesn't take a nonce or check for duplicate recovery attempts. An attacker could replay a recovery approval set.
+
+9. **`transition_key` for Lost→Active ("found again") requires no proof** - C6 covers this.
+
+10. **`KeyState::Expired` has no transitions** - Once expired, key is stuck. Is this intentional? The transition table doesn't allow Expired→anything. But `can_transition_to` doesn't have Expired as source. So Expired is terminal like Revoked. But no test covers this.
+
+11. **`verify_capability` checks `ctx.now >= cap.issued_at`** - But `issued_at` could be in the future (clock skew). If `issued_at > now`, capability is "not yet valid" and fails. But if `issued_at` is far in future, it fails. This is correct behavior but worth noting.
+
+12. **`Capability` has no signature field** - The signature is verified externally via `VerifierContext.signature_valid`. The capability itself doesn't carry the signature. This is by design (separation) but means the capability struct isn't self-contained.
+
+13. **`Receipt` has no timestamp** - When was the verification performed? Not recorded.
+
+14. **`Receipt` has no verifier identity** - Who performed the verification? Not recorded.
+
+15. **`Established` carries `key_state_at_check` but not `checked_at` timestamp** - When was the establishment done?
+
+16. **`HumanClaim.issued_by` is a Witness** - But Witness has no key/signature. It's just an ID string. Critique #8 covers this ("Witness isn't a witness").
+
+17. **`Evidence.witness` is a Witness** - Same issue.
+
+18. **`Freshness.witness` is a Witness** - Same issue, plus G3.
+
+19. **No canonical serialization** - Critique #21, G4.
+
+20. **`Error::InvalidPolicy(String)` is catch-all** - Used for subject mismatch, audience mismatch, empty scope, nonce replay, expiry, bad signature. Different errors conflated.
+
+21. **`recover` function: `new_key: KeyId` taken by value, `old_key: &KeyId` by reference** - Inconsistent API.
+
+22. **`activate_key` called at end of `recover`** - If it fails, recovery event already recorded, old key revoked. State corruption.
+
+Let me focus on the most critical ones not explicitly in the critique/AUDIT.
+
+### Critical findings not in critique/AUDIT:
+
+1. **Recovery state corruption on duplicate new_key** (lifecycle.rs) - CRITICAL
+2. **Future-dated freshness attestation bypasses staleness check** (evidence.rs) - HIGH

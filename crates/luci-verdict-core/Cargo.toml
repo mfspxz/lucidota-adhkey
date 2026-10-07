@@ -1,0 +1,6 @@
+[package]
+name = "luci-verdict-core"
+version = "0.1.0"
+edition = "2021"
+description = "luci-verdict: staged epistemic verdict pipeline. CLAIMED -> ESTABLISHED -> AUTHORIZED with UNKNOWN propagation. No crypto here."
+license = "MIT OR Apache-2.0"

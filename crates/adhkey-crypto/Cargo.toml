@@ -1,0 +1,10 @@
+[package]
+name = "adhkey-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "AdhKey crypto: audited FOSS primitives only. No custom cryptography."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ed25519-dalek = "2"
+sha2 = "0.10"

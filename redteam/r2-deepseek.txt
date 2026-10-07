@@ -1,0 +1,141 @@
+# 1. Statement self-authority — HOLDS (partially)
+
+The primitive does *not* collapse "Alice said X" into "Alice was authorized to say X" at the type level: `authenticate` only checks signature validity against `s.issuer`, and `reduce` only records `Controls`/`Replaces` effects. Authorization is expressed as a separate predicate (`Authorizes`) and evaluated by policy, not derived from issuance.
+
+But the doctrine is not fully enforced:
+
+- `authenticate` accepts a signer-subject pair where `issuer == subject` with no cross-check against `DerivedState.controls` for that subject. A statement `issuer=Alice, predicate=Controls, object=Key(K)` is accepted and `reduce` inserts K into `controls[Alice]` — i.e. **Alice bootstraps her own control set from her own signature**, no prior authorization required. That is exactly the kill-target's failure mode, one level down: the statement grants itself the authority it asserts.
+- `subject != issuer` bypass (e.g. Alice issuing `Controls` on Bob) is *also* accepted; `reduce` writes `controls[Bob] += K` with no check that Alice controls Bob. The type system does not prevent it; the doctrine comment does.
+
+**Verdict:** collapse prevented only for `Authorizes`; **BROKEN for `Controls`/`Replaces` genesis.** Exploit:
+
+```rust
+let s = Statement {
+  subject: subj("test","S1"), issuer: subj("test","S1"),
+  predicate: Predicate::Controls,
+  object: Object::Key(KeyRef([0xAA;32])),
+  sequence: 0, previous: [0;32], ...
+};
+authenticate(s, None, |_,_,_,_| true).unwrap(); // accepted
+// reduce() -> controls[S1] = [0xAA]
+```
+
+# 2. Genesis / trust-root — BROKEN
+
+`previous=[0;32]` + `sequence=0` is accepted by `authenticate(None, ...)` with *any* issuer, *any* subject, *any* predicate, *any* key. There is no genesis anchor type, no registry of accepted roots, no doctrine of who may originate a chain.
+
+The comment in T1 test (`equivocation_is_conflict_not_tiebreak`) even relies on this: `g = authenticate(stmt(0,[0;32]), None, ...)` — the test's own issuer is self-appointed. `reduce` then treats that genesis as authoritative input for `controls`.
+
+`KeyRef::of_public_key` provides a canonical fingerprint but nothing binds a `KeyRef` to a genesis statement. Anyone can mint a `SubjectRef` namespace (e.g. `"government"`) and a genesis statement claiming it.
+
+**Constructed counterexample:** attacker publishes `SubjectRef{namespace:"witness:dmv", id:"alice"}` genesis controlling key K_evil. Downstream consumers that filter on namespace string (which the code encourages as "never a bare string") will treat K_evil as DMV-controlled. No cryptographic or contractual root exists.
+
+# 3. Sequence attacks — HOLDS for basics, BROKEN for several
+
+What holds:
+- duplicate seq+same parent: `prev.inner.sequence + 1` check rejects.
+- skipped: same check.
+- replay: `previous` hash check rejects.
+- same seq + different parent: both checks fail.
+
+What breaks:
+
+**(a) Branch merge.** `reduce` iterates `log` linearly. `seen_prev` is keyed on `(issuer, subject, previous)`. If attacker supplies two branches whose *effects* are disjoint (e.g. one `Controls`, one `Withdraws`), the first branch's effects are applied, the second's detection fires only when the second is seen — but if the second branch's `previous` is a hash from the first branch, no fork is detected. `derive_state` has no epoch/DAG resolution; it is a fold over a *vec*, and the vec order is caller-supplied.
+
+**(b) Post-fork effects survive.** In the test, `reduce(&[g,a1,a2])` — a2 is a *sibling* of a1 and gets `continue`d. But `reduce(&[g,a1,b1,a2])` where b1 is a child of a1 will apply b1's effects, *then* hit a2 and record a conflict. State already mutated. **The order of `log` changes `DerivedState` for fork cases** despite `reduce` being called "pure." This is a TOCTOU between fork detection and effect application.
+
+**(c) Sequence reset after recovery.** `Replaces{old,new}` has no sequence semantics. A `Controls` chain at seq N is followed by any statement at N+1 whose `previous` matches — including a `Replaces` naming an unrelated `old` key that was never controlled. `Retain` is a no-op for absent keys; the new key is added regardless.
+
+**(d) Overflow.** No check on `prev.inner.sequence + 1` overflow. `u64::MAX` genesis then a "next" is impossible, but the code path uses `+` not `checked_add`. In debug builds this panics; in release it wraps. Not exploitable via valid signatures but a DoS surface if the seq is signed by a hostile (but legitimately rooted) issuer.
+
+**(e) Sequence scope.** `AuthError::ChainBreak` checks `issuer`/`subject` equality but not `predicate`, `policy`, or `suite`. An issuer can mix `Controls` and `Custom("..."` statements in one sequence — probably intended, but it means "chain" is a blended log, not a chain per concern. Equivocation is only detected per `(issuer, subject, previous)`, so an issuer may legitimately interleave unrelated predicates. This is a scope debt, not a bug, but it makes (a)/(b) worse.
+
+**Verdict:** BROKEN on merge, order-dependence, and recovery semantics.
+
+# 4. Canonical encoding — BROKEN
+
+One semantic statement → one byte sequence is **false** across multiple axes:
+
+**(a) `push_field` length is `data.len() as u64`, but the tag itself is not length-prefixed and there is no tag-content rule.** `b"sub-ns"`, `b"sub-id"`, etc. are distinct, so tag collisions are hard. But `canonical_predicate(Custom(s))` and the surrounding `push_field` mean the *predicate string content* is inside a length-delimited blob — safe. However `canonical_object(Object::Text(t))` and `canonical_object(Object::Bytes(b))` prefix `b"text:"` / `b"bytes:"` *inside* an already length-prefixed field. Fine. But `canonical_predicate(Custom("controls"))` produces `b"custom:controls"`, and `Predicate::Controls` produces `b"controls"` — no collision because of the colon. Good.
+
+**(b) `EvidenceRef` encoding swallows the `valid_until` field conditionally.** `None` → no `e-until` field emitted. `Some(0)` → `e-until=0` emitted. Two `EvidenceRef`s that differ only in `valid_until: None` vs `Some(u64::MAX)` produce different bytes (correct), but `valid_from` is always emitted, so `valid_from=0, valid_until=None` and a hypothetical `valid_from=0` with nothing else are the same. Fine. **However**: `valid_until: Some(x)` with `x < valid_from` is not rejected. Semantically invalid evidence is canonically byte-identical to whatever it says. **The canonical encoder does not normalize the semantic layer**, so two semantically *contradictory* encodings both canonicalize. Requirement "one semantic statement → one canonical byte sequence" is not the same as "one byte sequence → one semantics," but the source comment claims the former. The test only checks identical struct fields produce identical bytes.
+
+**(c) Unicode normalization.** No NFC/NFD anywhere. `SubjectRef{namespace:"café"}` with composed vs decomposed é produces different canonical bytes and different `statement_hash`. Same semantic subject, two hashes. `Object::Text` likewise. This is a direct break of the stated requirement.
+
+**(d) Empty/giant lengths.** `push_field` writes `data.len() as u64`. A field of `usize::MAX` on 32-bit target truncates. On 64-bit, no cap. `Object::Bytes(vec![0; 1<<32])` will allocate on canonicalize.
+
+**(e) Tag reordering.** Fields are emitted in fixed order, good. But `evidence` is a `Vec` and encoded in iteration order; two statements with the same evidence *set* but different vec order produce different canonical bytes. "Same semantic statement" fails.
+
+**(f) Length-prefix does not prevent tag-content confusion** because `tag` bytes are raw and not length-delimited. Two fields `tag=b"ev", data=A` and `tag=b"e", data=B` where `B` starts with `"v" + len(A)...` could collide in principle, but tags are fixed constants in the emitter, so a *decoder* attacker cannot inject. Not exploitable for signing, but no parse-order safety.
+
+**Verdict: BROKEN** (Unicode, evidence ordering, no semantic normalization, no length cap).
+
+# 5. Signature substitution — BROKEN via `suite` and field ambiguity
+
+The signature covers `canonical_bytes(s)` which *includes* `suite` as the last field. Good — the suite is bound. But:
+
+**(a) `verify_sig(&s.issuer, &bytes, &s.signature, &s.suite)`.** The `suite` string is *inside* the signed bytes, so a signature made with suite "ed25519" over bytes containing `suite="ed25519"` will be replayed correctly. But a `suite` value like `"ed25519"` vs `"Ed25519"` vs `" ed25519"` produces different bytes and different signatures — fine, they're different bytes. However the `verify_sig` callback *receives the suite as a separate parameter*. If the verifier dispatches on the parameter using a prefix match or case-insensitive compare (a natural implementation choice), the signature over canonical bytes is *still* bound to the exact suite string. So substitution requires suite-string collision in the verifier's dispatch, which is a caller bug, not this code's.
+
+**(b) More serious: `signature` is `Vec<u8>` with no suite-defined canonicalization.** Two valid signatures (different nonces, ECDSA malleability) over the same canonical bytes both pass. That's fine for signature identity but it means `statement_hash` is well-defined while `signature` is not — good, `hash` excludes signature. Wait — check: `statement_hash` = `sha256(b"ADHKEY/1/STMTHASH", canonical_bytes(s))`. `canonical_bytes` does **not** include `signature`. Correct: hash excludes signature. Good.
+
+**(c) Cross-statement transplant.** Because `hash` excludes `signature`, and `authenticate` verifies signature over canonical bytes, transplanting a valid signature from A to B requires A and B canonicalize to the same bytes. They don't, unless a collision in the tagged encoding. So substitution HOLDS *given the verifier is honest about the suite parameter.*
+
+**(d) But domain separator is `b"ADHKEY/1/STATEMENT\n"` — a string, not a length-prefixed field.** A future domain like `b"ADHKEY/1/STATEMENT\nEXT"` would be a superset. Currently no such domain exists. Spec risk, not an exploit today.
+
+**Verdict: HOLDS** for substitution proper, with the caveat that `suite` must be treated as an opaque exact-match enum by the verifier, which the code does not enforce (it is a free `String`).
+
+# 6. Issuer/key relationship — BROKEN
+
+Nothing binds `issuer` (a `SubjectRef`) to any key. `verify_sig` is supplied by the caller as `Fn(&SubjectRef, &[u8], &[u8], &str) -> bool`. The signature check is only meaningful if the caller's closure independently resolves `SubjectRef → authorized key set` and enforces membership. The code passes the `SubjectRef` through, but:
+
+- No type-level linkage between `issuer` and `KeyRef`.
+- No field on `Statement` naming the issuing key. The signature is over canonical bytes, but the verifier is free to accept the signature under *any* key it associates with `issuer` — including a key asserted by an unrelated statement.
+- To authorize, a verifier must reduce history, find `controls[issuer]`, and check the signature against each key. That logic lives entirely outside this module.
+
+**Concrete exploit shape:** the caller's `verify_sig` closure caches "issuer → keys" from an earlier log snapshot. A `Replaces` statement advances control, but the closure uses stale state. The statement model does not carry the `state_version` or `controls_epoch` at which the signature is meaningful. Doctrine #2 (freshness bound) is violated by the *interface*, even if a careful caller avoids it.
+
+**Verdict: BROKEN** at the API level. Three caller-supplied strings (`issuer`, `suite`, plus the closure's key resolution) = the "caller-controlled identity problem moved into the constructor," exactly as the kill-list predicted.
+
+# 7. Evidence recursion — BROKEN (no termination)
+
+`EvidenceRef.issuer: SubjectRef` is a bare reference. There is no field for the evidence's own chain, no `attested_by` recursion, no depth bound, no required root. `EvidenceRef.valid_until: Option<u64>` is optional; `revoked: bool` is caller-set. `reduce` ignores evidence entirely.
+
+The termination condition the kill-list asks for does not exist. Evidence is a flat list; a policy evaluating it must implement its own recursion, cycle detection, and depth bound, and the model will happily encode cycles (`A attests B` with evidence ref to `B attests A`) with distinct hashes.
+
+**Constructed counterexample:** `Statement S1` (Alice is_person) with `evidence[0]` pointing to digest of `S2` (Bob attests Alice). `S2` has `evidence[0]` pointing to digest of `S1`. Both authenticate (independent chains, independent issuers). `reduce` sets no conflict. Any downstream policy that follows evidence has to detect the loop itself.
+
+**Verdict: BROKEN.** Doctrine #4 (independence counting) is not just unenforced — it is un-representable; there is no field for trust-domain, independence class, or root.
+
+# 8. Policy as a statement — BROKEN / not implemented
+
+`Statement.policy: String` is a free string. There is no `PolicyHash`, no `PolicyVersion`, no evaluator identity, no input binding, no verdict type. `reduce` does not evaluate policy. `authenticate` does not check that the policy string names anything.
+
+Worse: `reduce` will record `Controls` effects from any statement whose signature verifies, regardless of `policy`. A statement with `policy="deny-all"` still mutates `controls`. The policy string is decorative.
+
+**No exploit needed — this kill-target is simply not addressed by the code.** The `establish(..., policy_satisfied: bool)` pattern the designer wanted to avoid is not replaced; the field just becomes a string that nothing reads.
+
+**Verdict: BROKEN.**
+
+---
+
+# NEW: findings not in the 8
+
+**N1. `reduce` is not, in fact, order-independent, despite the "pure function" claim.** Fork detection is `continue`-on-second-occurrence, but effects from the *first* branch's descendants are already applied before the sibling is seen. `reduce(&[g, a1, child_of_a1, a2])` ≠ `reduce(&[g, a1, a2, child_of_a1])`. Any `DerivedState` used for authorization therefore depends on log delivery order. Combined with T3(b), this is the most serious undetected bug.
+
+**N2. `Predicate::Replaces { old, new }` draws `old`/`new` from the *object* position, but `Predicate` already carries typed fields, and `canonical_bytes` encodes `pred` before `object`.** A `Replaces{old,new}` statement can be issued with `object = Object::Text("irrelevant")` and `reduce` will still apply `v.retain(k != old); v.push(new)` — the typed payload in the predicate is authoritative, the object is decorative. Two channels for the same semantics, one ignored. Canonical encoding includes both, so two byte-sequences with the same effect exist.
+
+**N3. `reduce` `Withdraws` never actually applies to `controls`.** The comment at the end (`// Apply withdrawals to controls...`) is dead code: `let _ = &st.withdrawn;`. Withdrawals accumulate in a list that nothing reads. **A withdrawn `Controls` statement leaves its key in `controls` forever.** This is a live bug, not a TODO — the code compiles and the test suite does not cover it.
+
+**N4. `AuthenticatedStatement` fields are private but `Statement` derives `Clone`, and `AuthenticatedStatement` derives `Clone`.** So an `AuthenticatedStatement` clones cheaply, but there is no way to *downgrade* to `Statement` and re-authenticate against a different `prev_auth` — good, that's the right direction. However `authenticate` takes `s: Statement` *by value*, and the returned `AuthenticatedStatement` holds it. A caller that obtained a `Statement` from a `Clone` of an `AuthenticatedStatement` cannot re-authenticate it against a *different* parent without first going through `authenticate`, which is correct. No bug here, but the type is not `#[non_exhaustive]` and its `Debug` derive will print the inner `Statement`, which may leak into logs.
+
+**N5. `previous` is hashed in `canonical_bytes` as `b"prev"` with `data = &s.previous` (32 raw bytes), while other 32-byte values (`KeyRef`, `StatementHash` in `Object`) use a `b"key:"` / `b"stmthash:"` prefix inside the object encoding.** Consistency is fine, but note `canonical_bytes` emits `prev` *after* `seq` and *before* `suite`. If a decoder is written by field-tag scanning (not the fixed order specified), a `suite` string that contains the byte sequence `"prev" + <8 bytes>` could be misparsed. The encoder is fixed-order, so no signing risk; but the model does not provide a decoder, and any future decoder must be aware that field content is length-prefixed but *tags* are not. Spec hazard.
+
+**N6. `AuthError` is `PartialEq + Eq` but not `Copy`, and has no `source()` / `Display`.** Minor, but if this is meant to be a wire-adjacent error type, downstream matching on `AuthError` variants (e.g. to map to retryable/non-retryable) needs `#[non_exhaustive]` and a stable discriminant.
+
+**N7. `Predicate::Custom(String)` is hashed with `b"custom:"` prefix, but `Predicate::Replaces`'s encoded form uses `:` separators between two 32-byte key hashes.** `Custom("…")` containing `:` is fine because the prefix `custom:` already differentiates. But `Replaces` uses raw concatenation: `old.0` (32) + `b":"` + `new.0` (32) = 65 bytes, unambiguous. Good. **However, `Controls`, `Attests`, `Authorizes`, `Withdraws`, `Supersedes` are all single-token byte strings with distinct prefixes; a `Custom("controls")` produces `b"custom:controls"` which collides with none. Correct.** Striking this from the findings.
+
+**N8. `KeyRef::of_public_key` uses domain `b"ADHKEY/1/KEYREF"`, `statement_hash` uses `b"ADHKEY/1/STMTHASH"`, but `canonical_bytes` uses `b"ADHKEY/1/STATEMENT\n"` — note the trailing newline on one and not the others.** Inconsistent domain-separator convention. A future domain string `"ADHKEY/1/STATEMENT"` (no newline) would be a prefix, but since `push_field` writes `sub-ns` immediately, the newline distinguishes. Still, no reason for one to have a newline and not the others; this is a spec-formatting hazard, harden before implementation diversity.
+
+**N9. `reduce` uses `seen_prev` across the entire log with key `(issuer, subject, previous)`, but `authenticate` is called by the caller, not `reduce`.** A caller may `authenticate` each statement independently against a *different* `prev_auth`, producing a log of `AuthenticatedStatement`s that are individually valid but form a forest, not a chain. `reduce` will accept this forest and detect forks between unrelated branches — potentially flagging legitimate independent histories as equivocation, or vice versa. `reduce` should take a single entry point (genesis) and walk, not a slice.
+
+**N10. No test covers divergence between `authenticate`'s chain check and `reduce`'s fork check.** A caller can build `[g, a1]` where `a1.previous == g.hash`, and `[g, a1']` where `a1'.previous == g.hash` and `a1'.subject != a1.subject` — different subjects, same previous. `authenticate` permits it. `reduce`'s fork key includes subject, so no conflict. Whether this is intended depends on whether `previous` is a *chain* pointer or an *issuer-global* pointer. The comment says "issuer's previous statement for this subject," but the encoding does not bind subject into `previous`. **`previous` is ambiguous: chain-of-chain, or chain-per-subject?** The `authenticate` boundary check enforces the latter implicitly (via `s.subject != prev.inner.subject` rejection). But `previous` bytes alone cannot disambiguate. If two statements share `previous` but differ in subject, a third party choosing to interpret `previous` as a global pointer will see a fork. Wire-level

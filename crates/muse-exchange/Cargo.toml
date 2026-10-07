@@ -1,0 +1,22 @@
+[package]
+name = "muse-exchange"
+version = "0.1.0"
+edition = "2021"
+description = "muse-exchange: sovereign daemon-less exchange organelle. Embedded SurrealDB authority graph, ternary hook verdicts, epistemic context budgets."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "muse-exchange"
+path = "src/main.rs"
+
+[lib]
+name = "muse_exchange"
+path = "src/lib.rs"
+
+[dependencies]
+surrealdb = { version = "2", features = ["kv-surrealkv"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+luci-verdict-core = { path = "../luci-verdict-core" }
+luci-context = { path = "../luci-context" }

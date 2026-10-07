@@ -1,0 +1,101 @@
+# TASK A — New findings
+
+**A1. HIGH — `recover()` is a confused deputy: approval key IDs are checked for *membership* but never confirmed to control the *old* key or the *new* key.**
+`lifecycle.rs::recover`, lines ~"Count distinct, usable, policy-listed recovery approvals". The function only checks `recovery_key_ids.contains(a)` and `rec.purpose == Recovery && rec.state.usable()`. It never checks that the recovery statement binds `old_key`, `new_key`, `seq`, or a nonce. Combined with A2, **any single recovery key that is currently Active can be replayed against every future recovery** because the approval set `{REC-1}` (and any other threshold-meeting subset) remains "usable" forever. There is no per-recovery challenge, no `old_key` binding, no nonce. A caller who once legitimately saw `approvals = [REC-1, REC-2]` for recovery X can replay those same two key IDs to authorize recovery Y, Z, … for the same identity — permanently — until those recovery keys are individually revoked.
+
+Exploit test:
+```rust
+let mut id = test_identity();
+recover(&mut id, &kid("KEY-01"), kid("KEY-02"), KeyPurpose::Authentication,
+        &[kid("REC-1"), kid("REC-2")]).unwrap();
+// One second later, attacker (no signing capability, just the ID list):
+recover(&mut id, &kid("KEY-02"), kid("ATTACKER"), KeyPurpose::Authentication,
+        &[kid("REC-1"), kid("REC-2")]).unwrap(); // succeeds
+```
+Note this is *not* the same as C2 (approvals-as-IDs); even if you bolt on signatures, without binding `(old_key, new_key, seq, nonce)` into the signed message you get A2 below.
+
+**A2. HIGH — `recover()` does not bind `new_key` to any prior event; new key can be attacker-chosen and re-chosen.**
+Same function. `activate_key(id, new_key, new_purpose)` is called with unchecked `new_key`. There is no cryptographic binding between the recovery approval set and either the old or new key identifiers. Combined with A1, the "approval" is a capability to install *any* key at *any* time, not a one-shot authorization for a specific successor.
+
+**A3. MED — `recover()` allows recovery of the *lost* multi-purpose case with a purpose-mismatched replacement.**
+`new_purpose: KeyPurpose` is caller-chosen and unvalidated against `old.purpose`. A recovery key approval meant to replace an `Authentication` key can be used to install a `Recovery` key (privilege escalation) or vice versa. Test:
+```rust
+recover(&mut id, &kid("KEY-01"), kid("NEW"), KeyPurpose::Recovery,
+        &[kid("REC-1"), kid("REC-2")]).unwrap();
+// NEW is now a recovery key, replacing an authentication key.
+```
+No check `new_purpose == old.purpose`, no policy hook to forbid it.
+
+**A4. MED — Recovery-on-revoked is asymmetric: the guard is `old.state == Revoked → err`, but `RecoveryKeyNotUsable` is only raised inside the loop. A single revoked approval key in an *otherwise-empty* approval slice silently no-ops past the `?` when it is the *only* item, then fails threshold.**
+Trace `recover` with `approvals = [revoked_rec]` where `revoked_rec ∈ policy`: the `contains` check passes, `id.keys.get(a)` returns `Some`, `rec.state.usable()` is false → returns `RecoveryKeyNotUsable`. That path is fine. But with `approvals = [non_policy_key]`: `continue` is taken, `counted` stays empty, threshold fails. Both correct. The actual bug: **the function returns `Ok(())` with `counted.len() == threshold` even when `counted` is a strict superset that includes a *now-revoked* key from a *concurrent* call** — see A6 TOCTOU.
+
+**A5. HIGH — `verifier.rs::verify_capability` performs the nonce `insert` *before* signature validity is known (line "if ctx.seen_nonces.insert(cap.nonce.clone())").**
+A caller who can submit a `Claimed<Capability>` with a *fresh nonce but invalid signature* burns that nonce permanently in `seen_nonces`. Because `signature_valid` is a caller-supplied `bool` (AUDIT C1 path), this is a **denial-of-service nonce-exhaustion primitive**: submit `{nonce: N_i, signature: garbage}` for a large set of `N_i`; the honest holder of the real capability for the same nonce space cannot replay. Worse: if a legitimately-signed capability `C` has a nonce the attacker can predict (e.g. from an earlier receipt), attacker pre-inserts it via a *failed* verification, then the honest holder's first attempt fails with "nonce replay". This is a TOCTOU where the verifier's state is mutated on the *failure* branch of a check that later decides the outcome.
+
+**A6. MED — `next_seq()` in `lifecycle.rs` computes `id.history.len() as u64 + 1`, but `recover()` calls `next_seq` *before* mutating state and again inside `activate_key`, so the sequence can collide with a concurrent read of `history`.**
+Not a thread-safety bug (no threads here) but a **logic bug under interleaving with concurrent readers of `history`**: `recover` reads `next_seq(id)`, then does `record(...)`, then calls `activate_key` which calls `next_seq` *again* — the two sequences differ by exactly 1 and are contiguous only if no other writer exists. In any multi-writer wrapper this is a seq-allocation race. In the single-writer case it's latent but the invariant "seq is monotonic and unique" is not enforced by the type: `Event::KeyActivated { seq }` and `Event::RecoveryCompleted { seq }` can in principle be built by any caller with any `seq` — the field is `pub`.
+
+**A7. MED — `court_key_substitution` test asserts less than its name promises.**
+The test activates `KEY-99`, then verifies a capability with `key_id = KEY-99` and asserts success. Its body comment says "only keys in THIS identity's table verify" — but the test *does verify* an attacker-activated key. The actual security property being tested (that an *unregistered* key fails) is tested only with the `ATTACKER-KEY` case; the `KEY-99` case exercises the ordinary path. The test name implies substitution-immunity; the assertions cover registration-lookup. If `activate_key` were ever made callable from an unauthenticated context (it is `pub`), this test would still pass.
+
+**A8. MED — `court_partial_recovery` asserts `id.key_state("KEY-01") == Active` after a *failed* recovery, but does not assert `KEY-02` was not inadvertently activated, nor that `history.len()` is unchanged.**
+The failure path in `recover` does `counted` accumulation and `?`s out *before* the mutation block, so it happens to be clean today. But the test would not catch a regression that moved `activate_key` above the threshold check. Weak assertion; name overpromises.
+
+**A9. MED — `Error::UnknownKey` from within the *approval loop* of `recover` leaks the existence/absence of arbitrary key IDs via error discrimination.**
+```rust
+let rec = id.keys.get(a).ok_or(Error::UnknownKey(a.clone()))?;
+```
+An attacker who can call `recover` with arbitrary `approvals` can distinguish "key ID exists but not in policy" (silent `continue`) from "key ID exists and is in policy but wrong purpose" (`WrongPurpose` via usable check → actually returns `RecoveryKeyNotUsable`) from "key ID does not exist at all" (`UnknownKey`). This is an **enumeration oracle** over the identity's key table. Combined with `KeyId(pub String)` (C4), the attacker learns which recovery key IDs exist in a target identity.
+
+**A10. MED — `KeyState::can_transition_to` permits `(Lost, Active)` but *not* `(Expired, *)` and *not* `(Revoked, *)` — however `recover()` explicitly overrides `Revoked` by mutating `rec.state = KeyState::Revoked` on the old key regardless of prior state, and there is a *second* path: if `old_key` is itself a policy recovery key that is `Active`, `recover` revokes it, but the check `old.state == KeyState::Revoked` only blocks a *second* recovery. A key that is `Active` and in `recovery_key_ids` can be revoked by recovery; this is by design but the docstring "The old key must exist (it may be Lost — that is the normal case)" does not mention the recovery-key-as-old-key case, and `activate_key` will then happily accept a `new_key` that is already the identifier of a previously-revoked key because `if id.keys.contains_key(&key)` only checks presence, not state — actually it errors on presence. But if `new_key == old_key` (same ID): `old_key` was just set to `Revoked` and remains in the map, so `activate_key` returns `IllegalTransition(Active, Active)`, *after* the recovery event has already been recorded. Result: **history records a `RecoveryCompleted` with no successor.** Invariant broken.
+```rust
+recover(&mut id, &kid("KEY-01"), kid("KEY-01"), KeyPurpose::Authentication,
+        &[kid("REC-1"), kid("REC-2")]).unwrap();
+// Error is returned, but id.history now contains RecoveryCompleted for a no-op recovery,
+// and KEY-01 is Revoked.
+```
+This is a genuine atomicity/ordering bug in the current code (independent of C2/C9).
+
+**A11. HIGH — `evaluate_claim()` can be coerced to return `Supported` with a *single* live piece of evidence of any kind.**
+```rust
+if live.is_empty() { return EpistemicState::Claimed; }
+let _ = &live;
+EpistemicState::Supported
+```
+The `SubjectKind` is never consulted despite the docstring ("a PERSON claim requires evidence a DEVICE claim does not"). Policy is a `String` that is never read. So `evaluate_claim` returns `Supported` uniformly for any non-empty live evidence set — same as `Claimed` in terms of *authorizability* today, but if any future code short-circuits `Supported → Established` (or trusts `Supported` as "policy was consulted"), it's a silent authority-laundering path. The comment "SUPPORTED unless the policy's bar is met AND no conflict" is a lie: nothing in the function knows the policy bar.
+
+**A12. MED — `Evidence.digest` is `[u8; 32]` but `EvidenceRegistry = BTreeMap<String, Evidence>` is keyed by `id`, and *nothing* in the codebase cross-checks `registry[id].digest == hash(artifact)`.**
+This is AUDIT G5, but the concrete follow-on is that `evaluate_claim` is callable on a `HumanClaim` whose `evidence` vector carries its own `Evidence` structs — so the `EvidenceRegistry` and the claim's embedded evidence can diverge without detection. An attacker who can mutate either one produces a `HumanClaim` that evaluates `Supported` regardless of registry contents.
+
+**A13. LOW — `capability.nonce` collides across audiences because the seen-set is keyed by nonce only, not `(audience, nonce)`.**
+`verify_capability` inserts `cap.nonce` into `ctx.seen_nonces` with no key. A capability targeting audience `A` with nonce `n` burns nonce `n` for audience `B`. Cross-audience replay is correctly blocked (it becomes a false rejection), but legitimate concurrent use of `n` across audiences is silently denied. Low severity but a correctness bug in multi-tenant deployments.
+
+**A14. LOW — `Check::NonceFresh` is pushed *even on the failing branch* in spirit: the `seen_nonces.insert` succeeds the first time and the check passes; the second call fails with `failed = Some(...)` but does not push any failing `Check` (the enum has no `NonceReplay` variant).** The receipt from a replayed call therefore contains `Check::KeyKnown, KeyUsable, …, NotExpired, SignatureValid` — i.e. it looks like a near-pass with no explicit "replay" marker. Auditors reading receipts cannot see *which* check failed. This is a receipt-completeness gap that contradicts the docstring "Every check is recorded in the receipt."
+
+**A15. MED — `verify_capability` early-returns on `UnknownKey` with a `fail_receipt` constructed by `fail_receipt` (which ignores `ctx`), but for all later failures it constructs a full `Receipt` inline. The two receipts have different field-population contracts; the early one includes no checks beyond what was already pushed, but the `_ = ctx` line means the function signature lies about needing `ctx`.** Cosmetic, but the type `(Error, Receipt)` does not distinguish "structural failure before any check" from "policy failure after partial checks." A caller branching on `receipt.checks.len()` will get inconsistent behavior.
+
+---
+
+# TASK B — Attacking the *naively fixed* recovery
+
+Assume C2 is fixed with "signatures over the recovery statement" and C9 fixed with "validate → construct next state → commit once."
+
+**B1. Replay of a signed recovery statement.**
+If the statement is signed over `(old_key, new_key, approvals, signatures)` and *nothing else*, a signed recovery statement is a bearer token. Two colluding (or one coerced) recovery signers can re-use their signature against the *same identity* after a later legitimate recovery revokes `new_key`. Fix: sign over `(identity_root, prev_seq, nonce, intent_kind, old_key, new_key, policy_version)` and have the reduce() step reject any statement whose `prev_seq` ≠ current head.
+
+**B2. Competing recoveries (race on head).**
+Two recovery statements S_a (to key A) and S_b (to key B), both validly signed, both carrying the same `prev_seq`. Under "validate-then-commit," both validators validate against `prev_seq = N`, both commit. Result depends on write ordering; the loser's signature is still valid and can be replayed against `prev_seq = N` (which no longer exists) *or*, worse, against a future `prev_seq = N` if seq numbers are recycled. Fix: seq is monotonic and never reused; the commit is conditional on `head.seq == statement.prev_seq`; second commit fails closed and the loser must re-sign against the new head.
+
+**B3. Recovery of a revoked identity.**
+The doctrine (and `KeyState`) treats `Revoked` as terminal for *keys*. But identity-level revocation does not exist in this code at all: `Identity` has no `state` field. A committed recovery statement signed *before* a hypothetical identity revocation, replayed *after*, succeeds — because the reduction has nowhere to look up "identity revoked." Fix: `Identity` needs an `IdentityState` and the reduce step must fail closed on any statement whose `prev_policy_version` predates a revocation.
+
+**B4. Policy version confusion.**
+`RecoveryPolicy` has no version. A statement signed under `threshold=2` is valid after the policy is mutated to `threshold=3` (or after `recovery_key_ids` is pruned), because the validator reads *current* policy, not the policy-as-of the statement. Worse, the reverse: an attacker who can influence policy edit ordering can install a weaker policy after collecting signatures under the stronger one, then replay those signatures as satisfying the weaker one — signature-over-`(old,new)` does not commit to `policy_hash`. Fix: statement must carry `policy_hash` and `policy_version`; reduce must reject if current policy hash ≠ statement's, unless the statement explicitly declares intent under an older version and the policy allows forward-application (it should not for recovery).
+
+**B5. Witness equivocation.**
+With signatures added, each recovery signer signs one statement. Nothing prevents signer W from signing S_a and S_b (both valid, both `prev_seq = N`, different `new_key`) and presenting each to different partitions of the network. Both partitions converge on different heads. When they gossip, the reduce step has two children of head N. If reduce is "last write wins by seq," it picks one and orphans the other — but the orphan's signatures are now burned against an orphaned head, and W has demonstrated two valid-looking histories. Fix: reduce must treat *any* two valid statements with the same `prev_seq` as `EpistemicState::Conflict` for that identity, and both heads become non-authorizable until manual resolution. This must be a first-class outcome, not a tiebreak.
+
+**B6. Replay of a *superseded* statement.**
+Signer signs recovery `R1: old=K1, new=K2`. Later, recovery `R2: old=K2, new=K3`. If R1 is not explicitly tombstoned by R2 (via `prev_seq` chain, which requires chain-aware reduce), R1 can be presented to a fresh verifier who has only a snapshot at `prev_seq < R1.prev_seq`. The fix is that recovery statements must be **chain-anchored** (each declares its `prev_seq`), and any verifier presenting a snapshot must reject statements whose `prev_seq ≠ snapshot.head.seq`.
+
+**B7. Signer

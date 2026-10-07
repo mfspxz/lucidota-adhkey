@@ -1,0 +1,11 @@
+[package]
+name = "adhkey-statement"
+version = "0.1.0"
+edition = "2021"
+description = "AdhKey Statement primitive: the atomic object. Everything else is a projection."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+adhkey-core = { path = "../adhkey-core" }
+luci-verdict-core = { path = "../luci-verdict-core" }
+sha2 = "0.10"
