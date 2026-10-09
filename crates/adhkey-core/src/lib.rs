@@ -3,9 +3,19 @@
 //! No cryptography here. No I/O. Pure types + transitions.
 //! The security-critical core. Keep it small enough to audit.
 
+pub mod envelopes;
 pub mod evidence;
 pub mod lifecycle;
 pub mod verifier;
+
+pub use envelopes::{
+    capability_envelope, possession_bytes, recovery_intent_bytes,
+    sealed_receipt_bytes, sealed_receipt_hash, seal_receipt,
+    sha256d, KeyOperator, NonceStore, PolicyDecision, ReceiptBody,
+    ReceiptLog, RecoveryIntent, SealedReceipt, SignedApproval,
+    SignedCapability, SignedPolicyVerdict, SignedPossessionProof,
+    policy_verdict_bytes,
+};
 
 #[cfg(test)]
 mod court;
@@ -178,15 +188,12 @@ pub struct Authorized<T> {
 }
 
 /// A verification receipt: what was checked, by whom, with what result.
-/// Receipts are derived, never caller-authored.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Receipt {
-    pub subject: Subject,
-    pub key_id: KeyId,
-    pub key_state: KeyState,
-    pub checks: Vec<Check>,
-    pub outcome: Outcome,
-}
+///
+/// C7: the old plain `Receipt` struct was forgeable by anyone who could
+/// construct it. Receipts of record are now `SealedReceipt`
+/// (hash-chained + signed by a service key); the verifier builds a
+/// `ReceiptBody` and seals it. There is no unsealed receipt type left
+/// in the protocol.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Check {
@@ -219,6 +226,29 @@ pub enum Error {
     RecoveryKeyNotUsable(KeyId),
     InvalidPolicy(String),
     DuplicateEvent(u64),
+    /// C5: the nonce bucket is full. Fail closed: the nonce is NOT
+    /// recorded and verification does NOT proceed. The host must size
+    /// buckets for its traffic or shed load upstream — silently
+    /// dropping replay protection is not an option.
+    NonceStoreFull,
+    /// C6: Lost -> Active requires fresh proof of possession.
+    /// Use `lifecycle::refound_key` with a `SignedPossessionProof`.
+    ProofOfPossessionRequired(KeyId),
+    /// C2: a recovery approval failed verification (bad signature,
+    /// wrong ceremony binding, replayed nonce, unauthorized signer...).
+    /// The string says which.
+    BadApproval(String),
+    /// C3: a policy verdict failed verification (bad signature,
+    /// unauthorized evaluator, claim mismatch, stale...).
+    BadPolicyVerdict(String),
+    /// C6: a possession proof failed verification.
+    BadPossessionProof(String),
+    /// C7: a sealed-receipt chain failed verification (bad signature
+    /// or broken prev_hash link).
+    ReceiptChainBroken,
+    /// The key operator (HSM/store/adapter) failed: unknown key,
+    /// malformed signature, backend down. Fail closed, never a pass.
+    KeyOperatorFailed(String),
 }
 
 impl fmt::Display for Error {

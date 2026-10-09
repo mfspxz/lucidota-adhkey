@@ -19,13 +19,18 @@ dependencies = [
 
 [[package]]
 name = "adhkey-core"
-version = "0.1.0"
+version = "0.2.0"
+dependencies = [
+ "adhkey-crypto",
+ "sha2",
+]
 
 [[package]]
 name = "adhkey-crypto"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "getrandom 0.2.17",
  "sha2",
 ]
 
@@ -43,6 +48,7 @@ name = "adhkey-store"
 version = "0.1.0"
 dependencies = [
  "adhkey-core",
+ "adhkey-crypto",
 ]
 
 [[package]]

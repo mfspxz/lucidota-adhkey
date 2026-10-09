@@ -7,7 +7,10 @@
 //!
 //! Identity is not PROOF OF HUMAN. It is COST OF FALSE CLAIM.
 
-use crate::{KeyId, Subject};
+use crate::{
+    policy_verdict_bytes, sha256d, Error, KeyId, KeyOperator, PolicyDecision,
+    SignedPolicyVerdict, Subject,
+};
 use std::collections::BTreeMap;
 
 /// What kind of subject this is. The protocol treats them differently;
@@ -105,6 +108,67 @@ pub struct HumanClaim {
     pub issued_at: u64,
     pub expires_at: Option<u64>,
     pub state: EpistemicState,
+    /// C3: keys authorized to sign policy verdicts over this claim.
+    /// A verdict from any other key is rejected, not evaluated.
+    pub policy_authorities: Vec<KeyId>,
+}
+
+fn push_field(out: &mut Vec<u8>, tag: &[u8], data: &[u8]) {
+    out.extend_from_slice(tag);
+    out.extend_from_slice(&(data.len() as u64).to_be_bytes());
+    out.extend_from_slice(data);
+}
+
+fn evidence_digest_bytes(e: &Evidence, out: &mut Vec<u8>) {
+    push_field(out, b"id", e.id.as_bytes());
+    push_field(out, b"kind", format!("{:?}", e.kind).as_bytes());
+    push_field(out, b"witness", e.witness.id.as_bytes());
+    push_field(out, b"domain", e.witness.trust_domain.as_bytes());
+    push_field(out, b"digest", &e.digest);
+    push_field(out, b"issued_at", &e.issued_at.to_be_bytes());
+    match e.expires_at {
+        Some(x) => push_field(out, b"expires_at", &x.to_be_bytes()),
+        None => push_field(out, b"expires_at", b"none"),
+    }
+    push_field(out, b"revoked", &[e.revoked as u8]);
+}
+
+impl HumanClaim {
+    /// Digest of the evidence set, order-independent (sorted by id).
+    /// A policy verdict snapshots this; if the evidence changes after
+    /// the verdict was signed, the verdict no longer applies.
+    pub fn evidence_snapshot(&self) -> [u8; 32] {
+        let mut sorted: Vec<&Evidence> = self.evidence.iter().collect();
+        sorted.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut out = Vec::new();
+        for e in sorted {
+            evidence_digest_bytes(e, &mut out);
+        }
+        sha256d(b"ADHKEY/1/EVIDENCE-SNAPSHOT", &out)
+    }
+
+    /// Canonical claim hash. A signed policy verdict binds to this —
+    /// a verdict for claim A cannot be replayed against claim B.
+    pub fn digest(&self) -> [u8; 32] {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ADHKEY/1/CLAIM\n");
+        push_field(&mut out, b"subject", self.subject.0.as_bytes());
+        push_field(&mut out, b"kind", format!("{:?}", self.kind).as_bytes());
+        push_field(&mut out, b"evidence_snapshot", &self.evidence_snapshot());
+        push_field(&mut out, b"policy", self.assurance_policy.as_bytes());
+        push_field(&mut out, b"issued_by", self.issued_by.id.as_bytes());
+        push_field(&mut out, b"issued_at", &self.issued_at.to_be_bytes());
+        match self.expires_at {
+            Some(x) => push_field(&mut out, b"expires_at", &x.to_be_bytes()),
+            None => push_field(&mut out, b"expires_at", b"none"),
+        }
+        let mut auth: Vec<&KeyId> = self.policy_authorities.iter().collect();
+        auth.sort();
+        for a in auth {
+            push_field(&mut out, b"authority", a.0.as_bytes());
+        }
+        sha256d(b"ADHKEY/1/CLAIM-HASH", &out)
+    }
 }
 
 /// Freshness: when was this state known, at what version, witnessed by whom.
@@ -154,26 +218,97 @@ pub fn evaluate_claim(claim: &HumanClaim, now: u64) -> EpistemicState {
     if live.is_empty() {
         return EpistemicState::Claimed;
     }
+    // C4: contradiction detection. Two live evidence items making
+    // incompatible statements about the SAME evidence id (same id,
+    // different artifact digests) is a real, reachable conflict — not
+    // decoration. (Revocation stays sticky and is checked above.)
+    {
+        let mut by_id: BTreeMap<&str, &[u8; 32]> = BTreeMap::new();
+        for e in &live {
+            match by_id.get(e.id.as_str()) {
+                Some(d) if *d != &e.digest => return EpistemicState::Conflict,
+                Some(_) => {}
+                None => {
+                    by_id.insert(e.id.as_str(), &e.digest);
+                }
+            }
+        }
+    }
     // Policy evaluation: the policy names a minimum evidence bar.
     // The core does not know what "medium" means — the policy does.
     // Here: SUPPORTED unless the policy's bar is met AND no conflict.
-    // Conflict detection: two live evidence items from different witnesses
-    // disagreeing is out of scope for the core; witnesses report conflict
-    // via revocation. A policy hook can upgrade this.
+    // Conflict is detected above, over the evidence set, for real.
     let _ = &live;
     EpistemicState::Supported
 }
 
-/// Promote SUPPORTED to ESTABLISHED. Only a policy evaluator does this,
-/// and only with the policy's own criteria. The core refuses to guess.
+/// Promote SUPPORTED to ESTABLISHED. C3: the bare `policy_satisfied: bool`
+/// is dead. Promotion requires a SIGNED policy verdict, verified here:
+///
+///  1. the evaluator's signature checks out over the canonical verdict
+///     bytes (built here);
+///  2. the evaluator is in `claim.policy_authorities`;
+///  3. the verdict binds THIS claim (`claim_hash` matches);
+///  4. the verdict binds the CURRENT evidence set (`evidence_snapshot`
+///     matches — evidence changed since evaluation = verdict is stale);
+///  5. the verdict is fresh (`evaluated_at` within `max_verdict_age_secs`).
+///
+/// Non-Supported states pass through untouched: revocation is sticky,
+/// conflict stays conflict, expiry is honest. A forged, unauthorized,
+/// mismatched, or stale verdict is an ERROR (loud, fail-closed) — never
+/// a silent non-promotion.
 pub fn establish(
     claim: &HumanClaim,
-    policy_satisfied: bool,
+    verdict: &SignedPolicyVerdict,
+    keys: &dyn KeyOperator,
     now: u64,
-) -> EpistemicState {
+    max_verdict_age_secs: u64,
+) -> Result<EpistemicState, Error> {
     match evaluate_claim(claim, now) {
-        EpistemicState::Supported if policy_satisfied => EpistemicState::Established,
-        s => s,
+        EpistemicState::Supported => {}
+        s => return Ok(s),
+    }
+    // 2. Authorized evaluator?
+    if !claim.policy_authorities.contains(&verdict.evaluator) {
+        return Err(Error::BadPolicyVerdict(format!(
+            "evaluator {} not authorized for this claim",
+            verdict.evaluator
+        )));
+    }
+    // 1. Signature over canonical bytes.
+    let msg = policy_verdict_bytes(verdict);
+    let ok = keys
+        .verify(&verdict.evaluator, &msg, &verdict.signature)
+        .map_err(|e| Error::KeyOperatorFailed(format!("verdict check failed: {e}")))?;
+    if !ok {
+        return Err(Error::BadPolicyVerdict("verdict signature invalid".into()));
+    }
+    // 3. Bound to THIS claim?
+    if verdict.claim_hash != claim.digest() {
+        return Err(Error::BadPolicyVerdict(
+            "verdict binds a different claim".into(),
+        ));
+    }
+    // 4. Bound to the CURRENT evidence set?
+    if verdict.evidence_snapshot != claim.evidence_snapshot() {
+        return Err(Error::BadPolicyVerdict(
+            "evidence changed since verdict was evaluated".into(),
+        ));
+    }
+    // 5. Fresh?
+    if verdict.evaluated_at > now {
+        return Err(Error::BadPolicyVerdict(
+            "verdict evaluated in the future".into(),
+        ));
+    }
+    if now - verdict.evaluated_at > max_verdict_age_secs {
+        return Err(Error::BadPolicyVerdict("verdict stale".into()));
+    }
+    // The verdict is authentic, authorized, bound, and fresh.
+    // Its ternary decision — not a bool — drives promotion.
+    match verdict.decision {
+        PolicyDecision::Allow => Ok(EpistemicState::Established),
+        PolicyDecision::Deny | PolicyDecision::Unknown => Ok(EpistemicState::Supported),
     }
 }
 

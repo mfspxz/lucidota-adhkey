@@ -7,3 +7,4 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 adhkey-core = { path = "../adhkey-core" }
+adhkey-crypto = { path = "../adhkey-crypto" }
