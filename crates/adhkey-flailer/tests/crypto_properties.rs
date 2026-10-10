@@ -1,5 +1,7 @@
-//! T-CRYPTO: cryptographic property tests (RFC §9.1).
+//! PROPERTY TESTS (R-7) — T-CRYPTO: cryptographic property tests (RFC §9.1).
 //! Adversarial properties, not happy paths.
+//! Expectations here may never be rewritten to match a behavior change
+//! without adversarial sign-off.
 
 use adhkey_flailer::*;
 use rand::SeedableRng;

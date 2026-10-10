@@ -1,5 +1,17 @@
 # AdhKey — audit re-run after C1–C7 hardening
 
+> **R-1 CLAIM SCOPE (2026-10-10, rigor-audit rollout).** Every "FIXED" verdict
+> below is `class_scope: instance-only`. The negative tests replay the exact
+> payload each finding was written against; no dedicated red-team re-attack
+> wave has signed off the class since 2026-10-07. A FIXED claim here is a
+> regression guard for the finding's own instance, not class closure.
+> **One-book rule:** this document is the claim log AND the defeat log. Any
+> future bypass of a FIXED claim below MUST be mirrored here as
+> `SUPERSEDED-BY-BYPASS` against the original claim (with the defeating
+> evidence linked) — never filed only in a separate register.
+> **R-9 frozen vocabulary:** claim verdicts use only `FIXED | OPEN | PARTIAL |
+> OBSERVED | SUPERSEDED-BY-BYPASS`. No prose statuses.
+
 **Date:** 2026-10-07. **Scope:** same as AUDIT.md (`adhkey-core`,
 `adhkey-crypto`, `adhkey-store`) plus new `envelopes.rs`.
 **Method:** re-ran every critical finding against the new code; negative

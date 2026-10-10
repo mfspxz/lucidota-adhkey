@@ -1,4 +1,7 @@
-//! P3: rotation and enrollment tests.
+//! PROPERTY TESTS (R-7) — P3: rotation and enrollment invariant tests.
+//! Asserts epoch binding, non-resurrection of revoked shares, receipt
+//! integrity — invariants, not implementation behavior. Expectations here may
+//! never be rewritten to match a behavior change without adversarial sign-off.
 
 use adhkey_flailer::*;
 use ed25519_dalek::SigningKey;

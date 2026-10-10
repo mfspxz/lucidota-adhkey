@@ -1,5 +1,7 @@
-//! T-STATE: state-machine property tests at the governor level (RFC §9.2).
-//! Scripted adversarial traces; each asserts an invariant from the test plan.
+//! PROPERTY TESTS (R-7) — T-STATE: state-machine property tests at the governor
+//! level (RFC §9.2). Scripted adversarial traces; each asserts an invariant
+//! from the test plan. Expectations here may never be rewritten to match a
+//! behavior change without adversarial sign-off.
 
 use adhkey_flailer::*;
 use adhkey_flailer::governor::State;
