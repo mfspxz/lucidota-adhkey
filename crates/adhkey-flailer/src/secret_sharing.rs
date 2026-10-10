@@ -21,6 +21,23 @@ pub const SHARE_BYTES_LEN: usize = 33;
 #[derive(Clone)]
 pub struct UnverifiedShare(pub(crate) Vec<u8>);
 
+impl UnverifiedShare {
+    /// Build from raw share bytes (x || y). Validates structural shape only —
+    /// the bytes remain UNVERIFIED until wrapped/unwrapped through an envelope.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, Error> {
+        if bytes.len() != SHARE_BYTES_LEN {
+            return Err(Error::InvalidShare("bad share length"));
+        }
+        Share::try_from(bytes.as_slice()).map_err(|_| Error::InvalidShare("malformed share"))?;
+        Ok(UnverifiedShare(bytes))
+    }
+
+    /// Borrow the raw bytes (for envelope wrapping / paper encoding).
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// A share whose envelope authenticated and whose set/epoch/index bindings
 /// were verified. Only these may enter reconstruction.
 #[derive(Clone)]
@@ -39,14 +56,12 @@ impl VerifiedShare {
 /// Returns raw share byte strings (x || y); wrap them before distribution.
 pub fn split_root(root: &crate::RootSecret) -> Result<[UnverifiedShare; SHARE_COUNT], Error> {
     let sharks = Sharks(THRESHOLD);
-    let mut shares = sharks.dealer(root.as_bytes()).take(SHARE_COUNT);
+    let mut dealer = sharks.dealer(root.as_bytes()).take(SHARE_COUNT);
     let mut out: [UnverifiedShare; SHARE_COUNT] = Default::default();
-    for (i, slot) in out.iter_mut().enumerate() {
-        let share: Share = shares.next().ok_or(Error::InvalidShare("dealer short"))?;
+    for slot in out.iter_mut() {
+        let share: Share = dealer.next().ok_or(Error::InvalidShare("dealer short"))?;
         let bytes = Vec::from(&share);
         debug_assert_eq!(bytes.len(), SHARE_BYTES_LEN);
-        // Bind the dealer-assigned x coordinate to our index slot.
-        let _ = i;
         *slot = UnverifiedShare(bytes);
     }
     Ok(out)
@@ -220,12 +235,16 @@ pub fn encode_paper_share(share: &UnverifiedShare, set_id: [u8; 16], epoch: u64,
         .chunks(8)
         .map(|c| String::from_utf8_lossy(c).into_owned())
         .collect();
-    Ok(format!("{}-{}", grouped.join("-"), crc))
+    Ok(format!("FL1-{}-{}", grouped.join("-"), crc))
 }
 
 /// Decode and verify a paper backup. Returns the raw share bytes with bindings.
 pub fn decode_paper_share(encoded: &str) -> Result<(UnverifiedShare, [u8; 16], u64, u8), Error> {
-    let compact: String = encoded.chars().filter(|c| *c != '-').collect();
+    let stripped = encoded
+        .strip_prefix("FL1-")
+        .or_else(|| encoded.strip_prefix("FL1"))
+        .ok_or(Error::InvalidShare("missing FL1 prefix"))?;
+    let compact: String = stripped.chars().filter(|c| *c != '-').collect();
     if compact.len() < 8 {
         return Err(Error::InvalidShare("too short"));
     }

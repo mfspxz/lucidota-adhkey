@@ -397,13 +397,14 @@ NIST's July 2025 digital identity guidance is a useful reference for recovery co
 
 P0 — **DONE (2026-10-09).** Crate inspected, key hierarchy documented, defects D1–D8 recorded, design decisions resolved. Independent human review still required as a release gate.
 
-P1 — Cryptographic contract (blocking): implement real Shamir 3-of-5 via reviewed crate; random-root + passphrase-envelope design; salted memory-hard answer commitments; vault AAD binding; share-index/epoch tags; secret-logging test guard.
-Exit: unambiguous cryptographic design + independent review.
+P1 — **DONE (2026-10-09).** Cryptographic contract implemented: real Shamir 3-of-5 via reviewed `sharks` 0.4.3; random 256-bit root + passphrase envelope (Argon2id KEK → XChaCha); HKDF-SHA256 vault keys; salted memory-hard answer commitments; AAD-bound vaults and share envelopes; share-index/epoch/set bindings; checksummed paper backup; secret-logging test guard (T-LOG). Test evidence: `tests/crypto_properties.rs`, 17 tests (T-C1..T-C16, T-LOG, paper roundtrip) — full suite green 2026-10-09.
+Exit: unambiguous cryptographic design + independent review (review still queued).
 
-P2 — Recovery governor: typed states, transition validation, session binding, authorization thresholds, revocation, expiry, idempotency, signed receipts.
-Exit: randomized state-machine tests establish the authorization invariants.
+P2 — **CORE DONE (2026-10-09).** Recovery governor implemented: `governor.rs` (typed 10-state machine, transition table, session binding, expiry, epoch-revocation, idempotency with replay-returns-record, tombstoning with evidence retention, evidence-attempt budgets); `policy.rs` (versioned, fail-closed parsing); `guardians.rs` (Ed25519-signed, session-bound approvals; distinct-guardian threshold evaluation); `receipts.rs` (SHA256-chained, Ed25519-signed receipts, independently verifiable). Test evidence: `tests/governor_properties.rs`, 12/12 green (T-S1..T-S9 scripted adversarial traces + approval-signature + receipt-chain tests).
+Remaining for the exit condition: randomized (proptest) state-machine fuzzing — scripted traces pass; the fuzzer is queued.
 
-P3 — Guardian enrollment and approval: five-share enrollment, independently authenticated approvals, paper backup, epochs, replacement.
+P3 — **MACHINERY DONE (2026-10-09).** `rotation.rs` (epoch rotation re-sharing the same root; root rotation with vault re-encryption; signed rotation receipts; epoch-advancement enforced), enrollment receipts (`enroll_guardian`/`verify_enrollment_receipt` in `guardians.rs`), and the `flailer` CLI (`keygen`, `enroll`, `approve`, `paper`, `paper-verify`) — full ceremony smoke-tested end to end. Test evidence: `tests/rotation_properties.rs` 3/3 green; full workspace suite **32/32** (17 crypto + 12 governor + 3 rotation), EXIT:0.
+**Still Zack's action:** enrolling the actual humans (guardian identities, contact channels, paper storage location) and the first live drill. Design notes: `FLAILER-P3-DESIGN.md`.
 Exit: clean-device recovery works at the required threshold with no coordinator-held plaintext root.
 
 P4 — Authenticated timeline ingestion: provenance, timestamp uncertainty, fact integrity, challenge generation, replay defense, retention.

@@ -98,14 +98,21 @@ No duplicate crypto primitives. No hand-rolled primitives. Dependency posture is
 - Design v1: Share A passphrase-derived. RFC §17 flags it; this audit recommends the envelope design (D3). **Decision recorded, implementation pending.**
 - Design v1 assumes a coordinator that notifies humans. RFC makes the coordinator an untrusted relay. **RFC wins;** P1/P2 must not place trust in it.
 
-## 7. What P0 does NOT clear
+## 7. P1 implementation status (2026-10-09)
 
-- [ ] D1 fix (salted/memory-hard answer commitments) — P1
-- [ ] D2 fix (real Shamir + share envelopes) — P1
-- [ ] D3 decision implementation (envelope design) — P1
-- [ ] D4 fix (AAD binding) — P1
-- [ ] D5 fix (randomized challenge sampling) — P2/P3
-- [ ] D6 guard (secret-logging test) — P1, with the RFC test plan
+All P0 defects were implemented as fixes in the same session (failure-6 correction: phases run back-to-back):
+
+- [x] **D1 fixed** — `commitments.rs`: answers committed with fresh 128-bit salt + Argon2id(64MiB/3/4); constant-time verification. Bare SHA256 gone.
+- [x] **D2 fixed** — `secret_sharing.rs`: real Shamir 3-of-5 via reviewed `sharks` 0.4.3 (GF(256)); no hand-rolled sharing. Type-state: `UnverifiedShare` → authenticated `ShareEnvelope` → `VerifiedShare` → `recover_root`. Duplicates deduplicated; <3 distinct → error.
+- [x] **D3 implemented** — `key_hierarchy.rs`: random 256-bit root (CSPRNG, `ZeroizeOnDrop`); S0 sealed in passphrase envelope (Argon2id KEK → XChaCha20-Poly1305, AAD-bound); vault key = HKDF-SHA256(root, purpose || set_id || epoch).
+- [x] **D4 fixed** — `vault.rs`: versioned vault, AAD = `flailer-vault-v1 || version || set_id || epoch`; wrong set/epoch rejected. Share envelopes and the S0 envelope carry the same binding discipline.
+- [x] **D5 fixed** — `challenge.rs`: CSPRNG-shuffled, stratified round-robin sampling across categories; deterministic first-n gone.
+- [x] **D6 guard** — `t_log_secret_types_have_no_leaky_derives`: source-scanning test fails the build if any secret type derives `Debug`/`Display` (or `Serialize` on plaintext holders).
+- [x] **D7 documented** — `seal_vault`/`seal_share_envelope` return `Result`; RNG failure is `Error::Rng`, not a panic (better than the v1 `expect`).
+- [x] **Paper backup** — checksummed `FL1-` encoding with set/epoch/index bindings; tamper → checksum failure.
+
+**Test evidence:** `tests/crypto_properties.rs` — 17 tests (T-C1..T-C16, T-LOG, paper roundtrip); `tests/governor_properties.rs` — 12 tests (T-S1..T-S9, approval signatures, receipt chain). Final full run 2026-10-09: **29/29 green** (crypto 17/17 in 611s wall, Argon2id-bound, `--test-threads=1`; governor 12/12 in 0.37s), EXIT:0. Three test bugs were caught and fixed along the way (t_c16's vacuous randomness assertion; t_c4's 4000-KDF-op loop; paper encoder missing the literal `FL1-` prefix) — all fixed, suite re-run green. Process lessons: never run memory-hard KDF tests in parallel on this VM (2h thrash), and never edit sources mid-flight of a background cargo run.
+
 - [ ] Independent human review of this audit and the resulting design — **release gate, no substitute**
 
 ## 8. Auditor's limitation statement
