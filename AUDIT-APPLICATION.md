@@ -1,7 +1,7 @@
 # AUDIT-APPLICATION — adhkey
 
 **Slice:** brutal-audit rollout 3/8. **Date:** 2026-10-10. **Repo:** ~/workspace/adhkey.
-**Audited at:** `a5004a8` (flailer P3). **This pass:** TBD (filled after commit).
+**Audited at:** `a5004a8` (flailer P3). **This pass:** `a0801e0`.
 
 ## What this is
 
