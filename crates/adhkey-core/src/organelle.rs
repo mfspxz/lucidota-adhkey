@@ -305,7 +305,7 @@ mod tests {
                 "recovery_key_ids": ["REC-1", "REC-2", "REC-3"]
             }),
         )
-        .expect("create_identity")
+        .expect("create_identity").output
     }
 
     #[test]
@@ -334,11 +334,11 @@ mod tests {
         let id = host
             .call(&ctx, "ak", "activate_key",
                 serde_json::json!({"identity": id, "key_id": "KEY-01", "purpose": "Authentication"}))
-            .expect("activate_key");
+            .expect("activate_key").output;
         let st = host
             .call(&ctx, "ak", "key_state",
                 serde_json::json!({"identity": id, "key_id": "KEY-01"}))
-            .expect("key_state");
+            .expect("key_state").output;
         assert_eq!(st["state"], "Active");
 
         // duplicate activation is refused
@@ -351,7 +351,7 @@ mod tests {
         let id = host
             .call(&ctx, "ak", "transition_key",
                 serde_json::json!({"identity": id, "key_id": "KEY-01", "next": "Lost", "reason": "device stolen"}))
-            .expect("transition to Lost");
+            .expect("transition to Lost").output;
         // Lost -> Active REJECTED without proof of possession
         assert!(host
             .call(&ctx, "ak", "transition_key",
@@ -361,7 +361,7 @@ mod tests {
         let id = host
             .call(&ctx, "ak", "transition_key",
                 serde_json::json!({"identity": id, "key_id": "KEY-01", "next": "Revoked", "reason": "stolen"}))
-            .expect("transition to Revoked");
+            .expect("transition to Revoked").output;
 
         // history recorded every move (activate + 2 transitions)
         let hist = id["history"].as_array().unwrap();
@@ -370,18 +370,18 @@ mod tests {
         // can_transition oracle
         let c = host
             .call(&ctx, "ak", "can_transition", serde_json::json!({"from": "Active", "to": "Lost"}))
-            .expect("can_transition");
+            .expect("can_transition").output;
         assert_eq!(c["legal"], true);
         let c = host
             .call(&ctx, "ak", "can_transition", serde_json::json!({"from": "Revoked", "to": "Active"}))
-            .expect("can_transition");
+            .expect("can_transition").output;
         assert_eq!(c["legal"], false);
 
         // no usable auth keys left
         let ak = host
             .call(&ctx, "ak", "active_keys",
                 serde_json::json!({"identity": id, "purpose": "Authentication"}))
-            .expect("active_keys");
+            .expect("active_keys").output;
         assert_eq!(ak.as_array().unwrap().len(), 0);
 
         let n = host.verify_chain().expect("receipt chain must verify");

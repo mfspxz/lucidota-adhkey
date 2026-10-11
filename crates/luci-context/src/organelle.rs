@@ -75,7 +75,7 @@ fn manifest() -> OrganelleManifest {
     OrganelleManifest {
         schema_version: MANIFEST_SCHEMA_VERSION.to_string(),
         name: "luci-context".to_string(),
-        codon: "lx".to_string(),
+        codon: "lz".to_string(),
         version: "0.1.0".to_string(),
         description: "luci-context epistemic cache: truth/provenance/necessity-scored context with CAS-backed lossless compression".to_string(),
         contracts: vec![
@@ -83,7 +83,7 @@ fn manifest() -> OrganelleManifest {
                 "insert",
                 "insert a context item",
                 obj_schema(item_schema.clone(), &["key", "content", "truth", "source", "necessity"]),
-                "lx.write",
+                "lz.write",
             ),
             contract(
                 "get",
@@ -97,7 +97,7 @@ fn manifest() -> OrganelleManifest {
                     serde_json::json!({"key": {"type": "string"}, "summary": {"type": "string"}}),
                     &["key", "summary"],
                 ),
-                "lx.write",
+                "lz.write",
             ),
             contract(
                 "dereference",
@@ -120,7 +120,7 @@ fn manifest() -> OrganelleManifest {
                 "project",
                 "project the cache to a char budget (lossy-safe: unknown_introduced flags loss)",
                 obj_schema(serde_json::json!({"budget_chars": {"type": "integer"}}), &["budget_chars"]),
-                "lx.write",
+                "lz.write",
             ),
             contract(
                 "len",
@@ -306,7 +306,7 @@ mod tests {
     fn static_manifest_validates() {
         let m = validate_manifest_json(&manifest_json()).expect("static manifest must validate");
         assert_eq!(m.name, "luci-context");
-        assert_eq!(m.codon, "lx");
+        assert_eq!(m.codon, "lz");
     }
 
     #[test]
@@ -320,45 +320,45 @@ mod tests {
         let (org, dir) = test_organelle("a");
         let host = Host::new();
         host.register(org).expect("registration must succeed");
-        let ctx = CallContext::new("lx-test", vec!["lx.write".to_string()]);
-        let ro = CallContext::new("lx-ro", vec![]);
+        let ctx = CallContext::new("lz-test", vec!["lz.write".to_string()]);
+        let ro = CallContext::new("lz-ro", vec![]);
 
         // write gate
-        assert!(host.call(&ro, "lx", "insert", insert_input("k1", "hello world")).is_err());
+        assert!(host.call(&ro, "lz", "insert", insert_input("k1", "hello world")).is_err());
 
-        host.call(&ctx, "lx", "insert", insert_input("k1", "hello world")).expect("insert");
-        host.call(&ctx, "lx", "insert", insert_input("k2", &"x".repeat(5000))).expect("insert k2");
+        host.call(&ctx, "lz", "insert", insert_input("k1", "hello world")).expect("insert");
+        host.call(&ctx, "lz", "insert", insert_input("k2", &"x".repeat(5000))).expect("insert k2");
 
-        let g = host.call(&ro, "lx", "get", serde_json::json!({"key": "k1"})).expect("get");
-        assert_eq!(g["found"], true);
-        assert_eq!(g["item"]["key"], "k1");
+        let g = host.call(&ro, "lz", "get", serde_json::json!({"key": "k1"})).expect("get");
+        assert_eq!(g.output["found"], true);
+        assert_eq!(g.output["item"]["key"], "k1");
 
         // compress relocates bytes to CAS; dereference reconstructs them
         let c = host
-            .call(&ctx, "lx", "compress", serde_json::json!({"key": "k2", "summary": "lots of x"}))
+            .call(&ctx, "lz", "compress", serde_json::json!({"key": "k2", "summary": "lots of x"}))
             .expect("compress");
-        assert_eq!(c["compressed"], true);
+        assert_eq!(c.output["compressed"], true);
         let d = host
-            .call(&ro, "lx", "dereference", serde_json::json!({"key": "k2"}))
+            .call(&ro, "lz", "dereference", serde_json::json!({"key": "k2"}))
             .expect("dereference");
-        assert_eq!(d["found"], true);
-        let bytes = d["bytes_b64"].as_str().unwrap();
+        assert_eq!(d.output["found"], true);
+        let bytes = d.output["bytes_b64"].as_str().unwrap();
         assert_eq!(bytes.len(), 6668, "5000 bytes -> ceil(5000/3)*4 b64 chars");
 
         // byte-range dereference
         let dr = host
-            .call(&ro, "lx", "dereference", serde_json::json!({"key": "k2", "start": 0, "end": 3}))
+            .call(&ro, "lz", "dereference", serde_json::json!({"key": "k2", "start": 0, "end": 3}))
             .expect("range");
-        assert_eq!(dr["bytes_b64"], "eHh4"); // "xxx"
+        assert_eq!(dr.output["bytes_b64"], "eHh4"); // "xxx"
 
         // projection under a tight budget flags loss honestly
         let p = host
-            .call(&ctx, "lx", "project", serde_json::json!({"budget_chars": 10}))
+            .call(&ctx, "lz", "project", serde_json::json!({"budget_chars": 10}))
             .expect("project");
-        assert!(p.get("unknown_introduced").is_some());
+        assert!(p.output.get("unknown_introduced").is_some());
 
-        let l = host.call(&ro, "lx", "len", serde_json::json!({})).expect("len");
-        assert_eq!(l["len"], 2);
+        let l = host.call(&ro, "lz", "len", serde_json::json!({})).expect("len");
+        assert_eq!(l.output["len"], 2);
 
         let n = host.verify_chain().expect("receipt chain must verify");
         assert!(n >= 8, "register + calls = >=8 receipts, got {n}");

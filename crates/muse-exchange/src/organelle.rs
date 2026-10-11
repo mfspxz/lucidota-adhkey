@@ -39,7 +39,7 @@ fn manifest() -> OrganelleManifest {
     OrganelleManifest {
         schema_version: MANIFEST_SCHEMA_VERSION.to_string(),
         name: "muse-exchange".to_string(),
-        codon: "mx".to_string(),
+        codon: "mu".to_string(),
         version: "0.1.0".to_string(),
         description: "sovereign PreToolUse authority gateway: embedded epistemic graph + staged ternary verdict pipeline".to_string(),
         contracts: vec![
@@ -56,20 +56,20 @@ fn manifest() -> OrganelleManifest {
                     &["tool_name"],
                 ),
                 mutation_class: Some(MutationClass::Write),
-                required_capability: Some("mx.route".to_string()),
+                required_capability: Some("mu.route".to_string()),
             },
             Contract {
                 op: "apply_schema".to_string(),
                 description: "apply the epistemic schema (idempotent)".to_string(),
                 input_schema: obj_schema(serde_json::json!({}), &[]),
                 mutation_class: Some(MutationClass::Write),
-                required_capability: Some("mx.admin".to_string()),
+                required_capability: Some("mu.admin".to_string()),
             },
         ],
         authority: Authority {
             mutation_class: MutationClass::Write,
             declared_valence: Valence::Candidate,
-            required_capability: Some("mx.route".to_string()),
+            required_capability: Some("mu.route".to_string()),
             granted_capabilities: vec![],
         },
         transports: vec![Transport::Native, Transport::UnixSocket],
@@ -165,7 +165,7 @@ mod tests {
     fn static_manifest_validates() {
         let m = validate_manifest_json(&manifest_json()).expect("static manifest must validate");
         assert_eq!(m.name, "muse-exchange");
-        assert_eq!(m.codon, "mx");
+        assert_eq!(m.codon, "mu");
     }
 
     #[test]
@@ -185,18 +185,18 @@ mod tests {
         .expect("organelle init");
         let host = Host::new();
         host.register(org).expect("registration must succeed");
-        let ctx = CallContext::new("mx-test", vec!["mx.route".to_string(), "mx.admin".to_string()]);
-        let ro = CallContext::new("mx-ro", vec![]);
+        let ctx = CallContext::new("mu-test", vec!["mu.route".to_string(), "mu.admin".to_string()]);
+        let ro = CallContext::new("mu-ro", vec![]);
 
         // capability gates
         assert!(host
-            .call(&ro, "mx", "route", serde_json::json!({"tool_name": "Bash"}))
+            .call(&ro, "mu", "route", serde_json::json!({"tool_name": "Bash"}))
             .is_err());
         assert!(host
-            .call(&ro, "mx", "apply_schema", serde_json::json!({}))
+            .call(&ro, "mu", "apply_schema", serde_json::json!({}))
             .is_err());
 
-        host.call(&ctx, "mx", "apply_schema", serde_json::json!({}))
+        host.call(&ctx, "mu", "apply_schema", serde_json::json!({}))
             .expect("apply_schema");
 
         // no authorizes edge for Bash -> UNKNOWN path: never a hard failure,
@@ -204,13 +204,13 @@ mod tests {
         let d = host
             .call(
                 &ctx,
-                "mx",
+                "mu",
                 "route",
                 serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
             )
             .expect("route");
-        assert!(d["decision"].as_str().is_some(), "a decision was produced: {d}");
-        assert!(d["reason"].as_str().is_some());
+        assert!(d.output["decision"].as_str().is_some(), "a decision was produced: {d:?}");
+        assert!(d.output["reason"].as_str().is_some());
 
         let n = host.verify_chain().expect("receipt chain must verify");
         assert!(n >= 3, "register + calls = >=3 receipts, got {n}");

@@ -193,8 +193,8 @@ mod tests {
         let b2 = host
             .call(&ctx, "as", "canonical_bytes", serde_json::json!({"statement": s}))
             .expect("canonical_bytes");
-        assert_eq!(b1["bytes_hex"], b2["bytes_hex"]);
-        assert!(b1["bytes_hex"].as_str().unwrap().len() > 64);
+        assert_eq!(b1.output["bytes_hex"], b2.output["bytes_hex"]);
+        assert!(b1.output["bytes_hex"].as_str().unwrap().len() > 64);
 
         // evidence order does not change the bytes (sorted by digest)
         let mut s2 = stmt();
@@ -214,8 +214,8 @@ mod tests {
         let h3 = host
             .call(&ctx, "as", "statement_hash", serde_json::json!({"statement": serde_json::to_value(&s3).unwrap()}))
             .expect("hash3");
-        assert_eq!(h2["hash_hex"], h3["hash_hex"], "evidence set order must not change the hash");
-        assert_eq!(h2["hash_hex"].as_str().unwrap().len(), 64);
+        assert_eq!(h2.output["hash_hex"], h3.output["hash_hex"], "evidence set order must not change the hash");
+        assert_eq!(h2.output["hash_hex"].as_str().unwrap().len(), 64);
 
         let n = host.verify_chain().expect("receipt chain must verify");
         assert!(n >= 5, "register + calls = >=5 receipts, got {n}");
