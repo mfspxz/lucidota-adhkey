@@ -1,3 +1,5 @@
+[Active R&D Lab] — no CI runs on record; active development, expect rough edges.
+
 # AdhKey
 
 A portable identity/key-lifecycle protocol that sits above any vault,
