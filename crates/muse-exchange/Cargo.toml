@@ -14,6 +14,8 @@ name = "muse_exchange"
 path = "src/lib.rs"
 
 [dependencies]
+organelle-host = { path = "../../../organelles/crates/organelle-host" }
+organelle-manifest = { path = "../../../organelles/crates/organelle-manifest" }
 surrealdb = { version = "2", features = ["kv-surrealkv"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }

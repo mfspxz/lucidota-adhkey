@@ -16,6 +16,8 @@
 //! `luci-context` (projection semantics, eviction ordering) as libraries.
 //! The model is never the system of record. Ever.
 
+pub mod organelle;
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};

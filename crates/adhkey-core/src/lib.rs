@@ -3,6 +3,8 @@
 //! No cryptography here. No I/O. Pure types + transitions.
 //! The security-critical core. Keep it small enough to audit.
 
+pub mod organelle;
+
 pub mod envelopes;
 pub mod evidence;
 pub mod lifecycle;
@@ -27,7 +29,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// Opaque key identifier. Never carries key material.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyId(pub String);
 
 impl fmt::Display for KeyId {
@@ -37,7 +39,7 @@ impl fmt::Display for KeyId {
 }
 
 /// What a key is for. A key MUST NOT be used outside its purpose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyPurpose {
     Authentication,
     Signing,
@@ -46,7 +48,7 @@ pub enum KeyPurpose {
 }
 
 /// Lifecycle state of a key. Transitions are explicit and recorded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyState {
     Active,
     Lost,
@@ -75,13 +77,13 @@ impl KeyState {
 }
 
 /// Who or what the identity belongs to. Opaque to the protocol.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subject(pub String);
 
 /// A verification method: how this identity can be verified.
 /// Method-neutral: could be a raw public key, a DID URL, a WebAuthn
 /// credential id — the core does not care.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct VerificationMethod {
     pub id: String,
     pub method_type: String,
@@ -89,7 +91,7 @@ pub struct VerificationMethod {
 }
 
 /// Recovery policy: k-of-n recovery keys can authorize a successor key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryPolicy {
     pub threshold: usize,
     pub recovery_key_ids: Vec<KeyId>,
@@ -104,7 +106,7 @@ impl RecoveryPolicy {
 }
 
 /// A point-in-time record of one key's state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct KeyRecord {
     pub id: KeyId,
     pub purpose: KeyPurpose,
@@ -114,7 +116,7 @@ pub struct KeyRecord {
 }
 
 /// The identity. Method-neutral, offline-capable, no accounts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub identifier: String,
     pub subject: Subject,
@@ -139,7 +141,7 @@ impl Identity {
 }
 
 /// Lifecycle events. Append-only; history is the identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     IdentityCreated { seq: u64 },
     KeyActivated { key: KeyId, purpose: KeyPurpose, seq: u64 },
@@ -157,7 +159,7 @@ pub enum Event {
 
 /// A capability: a signed envelope authorizing an action.
 /// Verification is separate from issuance (see verifier module).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Capability {
     pub subject: Subject,
     pub scope: String,
@@ -170,10 +172,10 @@ pub struct Capability {
 
 /// The three epistemic states. These are DISTINCT TYPES.
 /// They MUST NOT collapse into one boolean.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Claimed<T>(pub T);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Established<T> {
     pub value: T,
     /// Which key established it, and in what state.
@@ -181,7 +183,7 @@ pub struct Established<T> {
     pub key_state_at_check: KeyState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Authorized<T> {
     pub value: T,
     pub capability: Capability,
@@ -195,7 +197,7 @@ pub struct Authorized<T> {
 /// `ReceiptBody` and seals it. There is no unsealed receipt type left
 /// in the protocol.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Check {
     KeyKnown,
     KeyUsable,
@@ -209,14 +211,14 @@ pub enum Check {
     SignatureValid,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Pass,
     Fail,
 }
 
 /// Errors. Fail closed: unknown state is an error, never a default-allow.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     UnknownKey(KeyId),
     KeyNotUsable(KeyId, KeyState),

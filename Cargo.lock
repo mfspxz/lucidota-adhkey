@@ -22,6 +22,10 @@ name = "adhkey-core"
 version = "0.2.0"
 dependencies = [
  "adhkey-crypto",
+ "organelle-host",
+ "organelle-manifest",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 
@@ -58,6 +62,10 @@ version = "0.1.0"
 dependencies = [
  "adhkey-core",
  "luci-verdict-core",
+ "organelle-host",
+ "organelle-manifest",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 
@@ -2202,13 +2210,21 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 name = "luci-context"
 version = "0.1.0"
 dependencies = [
+ "base64 0.21.7",
  "luci-verdict-core",
+ "organelle-host",
+ "organelle-manifest",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 
 [[package]]
 name = "luci-verdict-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "maplit"
@@ -2332,6 +2348,8 @@ version = "0.1.0"
 dependencies = [
  "luci-context",
  "luci-verdict-core",
+ "organelle-host",
+ "organelle-manifest",
  "serde",
  "serde_json",
  "surrealdb",
@@ -2498,6 +2516,28 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "organelle-host"
+version = "1.0.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "organelle-manifest",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "organelle-manifest"
+version = "1.0.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "parking"

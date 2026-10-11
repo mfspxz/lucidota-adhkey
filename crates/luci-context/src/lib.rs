@@ -11,6 +11,8 @@
 //! decision. What the cache cannot prove safe, it marks UNKNOWN and
 //! keeps retrievable — LOSSY_PROJECTION = UNKNOWN, never silent loss.
 
+pub mod organelle;
+
 pub mod cache;
 pub mod cas;
 pub mod item;

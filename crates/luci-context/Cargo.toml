@@ -6,5 +6,10 @@ description = "luci-context: epistemic context cache. Compress by truth/provenan
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+organelle-host = { path = "../../../organelles/crates/organelle-host" }
+organelle-manifest = { path = "../../../organelles/crates/organelle-manifest" }
+serde_json = "1"
+base64 = "0.21"
+serde = { version = "1", features = ["derive"] }
 luci-verdict-core = { path = "../luci-verdict-core" }
 sha2 = "0.10"

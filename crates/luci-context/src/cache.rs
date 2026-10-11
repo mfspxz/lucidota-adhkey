@@ -14,7 +14,7 @@ use std::io;
 
 /// Record of an eviction: what left, why, and how to get it back.
 /// Nothing is ever evicted without a reconstruction path.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct EvictedRecord {
     pub key: String,
     pub cas_hash: String,
@@ -25,7 +25,7 @@ pub struct EvictedRecord {
 
 /// A projected view: what the consumer sees, what was removed, and
 /// whether the projection introduced UNKNOWN the consumer must handle.
-#[derive(Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct Projection {
     pub kept: Vec<ContextItem>,
     pub evicted: Vec<EvictedRecord>,

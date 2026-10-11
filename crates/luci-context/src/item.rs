@@ -3,7 +3,7 @@
 use luci_verdict_core::Epistemic;
 
 /// The audit input trinity: where did this information originate?
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
     /// The system itself records this (ledger, receipts, CAS).
     System,
@@ -16,7 +16,7 @@ pub enum Source {
 /// Operational projection of necessity. Not ontology — this is the
 /// cache's working judgment about decision-relevance, and it can be
 /// wrong, which is why eviction is scored, not binary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Necessity {
     Required,
     Optional,
@@ -25,7 +25,7 @@ pub enum Necessity {
 
 /// The item's content: full bytes, or a compressed form that retains
 /// a path back to the original.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Content {
     Full(String),
     Compressed {
@@ -36,7 +36,7 @@ pub enum Content {
 }
 
 /// One unit of context under epistemic management.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ContextItem {
     /// Human key, e.g. "RFC-001.md".
     pub key: String,

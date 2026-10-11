@@ -5,7 +5,7 @@
 
 /// The epistemic state of a proposition. Discriminants are the
 /// canonical +1/0/-1 so the values are meaningful across serializations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i8)]
 pub enum Epistemic {
     Disproven = -1,

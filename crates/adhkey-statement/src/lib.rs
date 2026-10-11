@@ -36,6 +36,8 @@
 //! unicode dep); evidence recursion depth beyond self-reference (needs the
 //! artifact resolver); cross-implementation decoder spec.
 
+pub mod organelle;
+
 use luci_verdict_core::authority::{establish, Claimed, EstablishmentPolicy, Established};
 use luci_verdict_core::witness::{EvidenceSet, ProvenanceGraph, Witness};
 use luci_verdict_core::Epistemic;
@@ -49,7 +51,7 @@ mod tests;
 /// A subject reference: namespace + id. Never a bare string.
 /// `namespace` scopes the id: "exchange", "government", "witness:dmv"...
 /// Empty namespace or id is rejected at authenticate (nim-resub #11).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SubjectRef {
     pub namespace: String,
     pub id: String,
@@ -57,7 +59,7 @@ pub struct SubjectRef {
 
 /// A key reference: SHA-256 fingerprint of the public key bytes.
 /// Not a label. Two systems referring to the same key compute the same ref.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyRef(pub [u8; 32]);
 
 /// Statement hash. Alias also sidesteps a rustc parser quirk where
@@ -73,7 +75,7 @@ impl KeyRef {
 
 /// Predicates. Structural variants the core reasons about; Custom for
 /// everything policy-defined. The core never pretends Custom is closed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Predicate {
     Controls,
     Replaces { old: KeyRef, new: KeyRef },
@@ -87,7 +89,7 @@ pub enum Predicate {
 /// The object of a statement: what the predicate relates the subject to.
 /// Predicate/object compatibility is enforced: e.g. Controls requires a
 /// Key object, Withdraws a StatementHash (nim-resub #13, deepseek N2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Object {
     Key(KeyRef),
     StatementHash([u8; 32]),
@@ -99,7 +101,7 @@ pub enum Object {
 /// The artifact itself is never in the protocol.
 /// Validity windows are enforced at authenticate (nim-resub #9); the
 /// fan-out is bounded and self-reference rejected (nim-resub #7).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceRef {
     pub digest: [u8; 32],
     pub issuer: SubjectRef,
@@ -110,7 +112,7 @@ pub struct EvidenceRef {
 }
 
 /// A statement: the atomic object.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
     pub subject: SubjectRef,
     pub predicate: Predicate,
@@ -263,7 +265,7 @@ pub fn statement_hash(s: &Statement) -> [u8; 32] {
 /// public fields settable without the check (see `authenticate`).
 /// NOTE: this is still only a CLAIM. Authorization is a separate phase
 /// (`authorize_issuance`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedStatement {
     inner: Statement,
     hash: [u8; 32],
