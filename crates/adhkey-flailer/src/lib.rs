@@ -6,7 +6,7 @@
 //! Key hierarchy (normative):
 //! ```text
 //! root: random 256-bit (CSPRNG), NEVER derived from the passphrase
-//!   ├─ Shamir 3-of-5 → S0..S4 (via the reviewed `sharks` crate)
+//!   ├─ Shamir 3-of-5 → S0..S4 (via the reviewed `blahaj` fork)
 //!   │    ├─ S0: sealed in a passphrase envelope (Argon2id → XChaCha20-Poly1305)
 //!   │    ├─ S1..S3: guardian-held ShareEnvelopes (AAD-bound to set/epoch/index)
 //!   │    └─ S4: paper backup (checksummed encoding, offline capability)

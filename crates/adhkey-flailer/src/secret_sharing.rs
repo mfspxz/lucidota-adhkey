@@ -1,4 +1,4 @@
-//! Shamir 3-of-5 sharing over a reviewed implementation (`sharks`).
+//! Shamir 3-of-5 sharing over the reviewed `blahaj` fork.
 //!
 //! Type-state discipline: raw share bytes are `UnverifiedShare`; only an
 //! authenticated, binding-checked envelope yields a `VerifiedShare`, and only
@@ -7,7 +7,7 @@
 use crate::{random_bytes, Error};
 use chacha20poly1305::{aead::{Aead, Payload}, ChaCha20Poly1305, Key, KeyInit, Nonce};
 use serde::{Deserialize, Serialize};
-use sharks::{Share, Sharks};
+use blahaj::{Share, Sharks};
 use std::collections::HashSet;
 
 /// Cryptographic threshold and share count. Fixed for the v1 recovery set.
@@ -52,11 +52,11 @@ impl VerifiedShare {
     }
 }
 
-/// Split the root into 5 shares, threshold 3, via `sharks`.
+/// Split the root into 5 shares, threshold 3, via `blahaj`.
 /// Returns raw share byte strings (x || y); wrap them before distribution.
 pub fn split_root(root: &crate::RootSecret) -> Result<[UnverifiedShare; SHARE_COUNT], Error> {
-    let sharks = Sharks(THRESHOLD);
-    let mut dealer = sharks.dealer(root.as_bytes()).take(SHARE_COUNT);
+    let scheme = Sharks(THRESHOLD);
+    let mut dealer = scheme.dealer(root.as_bytes()).take(SHARE_COUNT);
     let mut out: [UnverifiedShare; SHARE_COUNT] = Default::default();
     for slot in out.iter_mut() {
         let share: Share = dealer.next().ok_or(Error::InvalidShare("dealer short"))?;
@@ -148,7 +148,7 @@ pub fn unwrap_share(
     if bytes.len() != SHARE_BYTES_LEN {
         return Err(Error::InvalidShare("bad share length"));
     }
-    // Structural validation: must parse as a sharks Share.
+    // Structural validation: must parse as a blahaj Share.
     Share::try_from(bytes.as_slice()).map_err(|_| Error::InvalidShare("malformed share"))?;
     Ok(VerifiedShare { index: env.index, bytes })
 }
@@ -166,11 +166,11 @@ pub fn recover_root(shares: &[VerifiedShare]) -> Result<crate::RootSecret, Error
     if distinct.len() < THRESHOLD as usize {
         return Err(Error::InsufficientShares);
     }
-    let sharks = Sharks(THRESHOLD);
+    let scheme = Sharks(THRESHOLD);
     let parsed: Result<Vec<Share>, _> =
         distinct.iter().map(|s| Share::try_from(s.bytes.as_slice())).collect();
     let parsed = parsed.map_err(|_| Error::InvalidShare("malformed share"))?;
-    let secret = sharks.recover(parsed.iter()).map_err(|_| Error::InvalidShare("recovery failed"))?;
+    let secret = scheme.recover(parsed.iter()).map_err(|_| Error::InvalidShare("recovery failed"))?;
     if secret.len() != 32 {
         return Err(Error::InvalidShare("recovered wrong length"));
     }
