@@ -73,6 +73,8 @@ crates/adhkey-flailer/tests/{crypto,governor,rotation}_properties.rs
 NOT re-run this pass (doc-only changes; 5.3G workspace, full run heavy).
 Last measured: **144 passed, 0 failed** across the workspace at AUDIT-FIXES
 time (2026-10-07) — label as not re-run, not current.
+Second sweep 2026-10-10: `cargo test -p adhkey-flailer --no-run` compiles
+clean (validates the test-header edits; not a test run).
 
 ## Wont-fix list (R-4)
 
